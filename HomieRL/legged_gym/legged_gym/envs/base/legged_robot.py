@@ -394,7 +394,7 @@ class LeggedRobot(BaseTask):
         self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
 
     #------------- Callbacks --------------
-    def _process_rigid_shape_props(self, props, env_id):
+    def _process_rigid_shape_props(self, props, env_id): #给每个机器人都随机初始化刚体摩擦系数
         """ Callback allowing to store/change/randomize the rigid shape properties of each environment.
             Called During environment creation.
             Base behavior: randomizes the friction of each environment
@@ -445,7 +445,7 @@ class LeggedRobot(BaseTask):
 
             self.gym.set_actor_rigid_shape_properties(env_handle, actor_handle, rigid_shape_props)
 
-    def _process_dof_props(self, props, env_id):
+    def _process_dof_props(self, props, env_id):#可在这个函数对关节属性进行修改
         """ Callback allowing to store/change/randomize the DOF properties of each environment.
             Called During environment creation.
             Base behavior: stores position, velocity and torques limits defined in the URDF
@@ -613,7 +613,7 @@ class LeggedRobot(BaseTask):
                                                      gymtorch.unwrap_tensor(self.root_states),
                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
-    def _push_robots(self):
+    def _push_robots(self): #随即给机器人一个推力，训练抗干扰能力
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
         """
         max_vel = self.cfg.domain_rand.max_push_vel_xy
