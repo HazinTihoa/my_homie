@@ -86,7 +86,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     obs = env.get_observations()
     print("obs: ",obs)
     print(obs.shape)
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     # load policy
     train_cfg.runner.resume = True
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
@@ -152,11 +152,11 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
         # —— 4. 推策略、步进仿真
         num_lower_dof = env.num_lower_dof
         actions = policy(obs.detach())
-        print(obs.detach())
+        # print(obs.detach())
         actions[:, num_lower_dof:] = 0
         print("actions: ",actions)
         print(actions.shape)
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         obs, *_ = env.step(actions.detach())
         actual_vx = env.base_lin_vel[0,0].item()
         actual_vy = env.base_lin_vel[0,1].item()
