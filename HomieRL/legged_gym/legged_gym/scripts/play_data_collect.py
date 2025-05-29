@@ -28,6 +28,7 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+import math
 from legged_gym import LEGGED_GYM_ROOT_DIR
 import os
 import keyboard 
@@ -36,7 +37,7 @@ import pygame
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
-
+from isaacgym import gymapi
 import numpy as np
 import torch
 
@@ -76,33 +77,36 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     env_cfg.terrain.mesh_type = 'plane'
     env_cfg.asset.self_collision = 0
     env_cfg.env.upper_teleop = False
+    
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     env.commands[:, 0] = x_vel
     env.commands[:, 1] = y_vel
     env.commands[:, 2] = yaw_vel
     env.commands[:, 4] = height
-    env.action_curriculum_ratio = 0.9
+    env.action_curriculum_ratio = 0
     obs = env.get_observations()
-    print("obs: ",obs)
-    print(obs.shape)
-    # import pdb; pdb.set_trace()
+    
     # load policy
     train_cfg.runner.resume = True
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
     policy = ppo_runner.get_inference_policy(device=env.device) # Use this to load from trained pt file
     
     # policy = load_onnx_policy() # Use this to load from exported onnx file
+    
+    #pygame
     pygame.init()
     font = pygame.font.SysFont(None, 24)
     screen = pygame.display.set_mode((500,300))  # 小窗口即可，仅为捕获键盘
     pygame.display.set_caption("HomieL 控制窗口")
     clock = pygame.time.Clock()
+    
+    
     if EXPORT_POLICY:
         path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'policies')
         export_policy_as_jit(ppo_runner.alg.actor_critic, path)
         print('Exported policy as jit script to: ', path)
-    print(policy)
+        
     camera_position = np.array(env_cfg.viewer.pos, dtype=np.float64)
     camera_vel = np.array([1., 1., 0.])
     camera_direction = np.array(env_cfg.viewer.lookat) - np.array(env_cfg.viewer.pos)
@@ -110,13 +114,52 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     cpu_inds = torch.arange(env.num_envs, dtype=torch.int32)
     env.reset_idx(cpu_inds)
     vx = vy = yaw = 0.0
+
+    #创建目标点
+    arrive_tollerance  = 0.3 #pos tollerance
+    heading_thresh = 0.1 #yaw tollerance
+    max_speed=1
+    viewer = env.viewer
+    env.gym.clear_lines(viewer)
+    np.random.seed(123)
+            
+    coef = np.random.rand(2)*2-1
+    a = np.round(coef*5, decimals=1) 
+    target_pos = np.array([a[0], a[1]], dtype=np.float32)
     for _ in range(30*int(env.max_episode_length)):
-        # —— 1. 处理 pygame 事件（否则无法更新键盘状态）
+
+        
+        tx, ty, tz = float(target_pos[0]), float(target_pos[1]), 1.0
+
+# build 横竖两段线的点阵，shape = (2*2, 3)
+        pts = np.array([
+            [tx - 0.1, ty,     tz],
+            [tx + 0.1, ty,     tz],  # 横线两个端点
+            [tx,      ty - 0.1, tz],
+            [tx,      ty + 0.1, tz],  # 竖线两个端点
+        ], dtype=np.float32)
+
+        # 对应每个点的颜色
+        cols = np.array([
+            [1.0, 0.0, 0.0],  # 红
+            [1.0, 0.0, 0.0],  
+            [1.0, 0.0, 0.0],  
+            [1.0, 0.0, 0.0],
+        ], dtype=np.float32)
+
+        # 一共2段线
+        count = 2
+
+        # 对每个环境都画一次
+        for env_handle in env.envs:
+            env.gym.add_lines(viewer, env_handle, count, pts, cols)
+            
+        
+        # —— 1. 处理 pygame 事件（否则无法更新键盘状态）True
         screen.fill((30, 30, 30))
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 return
-
             elif ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_w:
                     vx += 0.5
@@ -142,22 +185,69 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             if height<-1: height =-1      
             if yaw>3:  yaw =3
             if yaw<-3: yaw =-3
+            
+        current_pos = env.root_states[0, :2].cpu().numpy()  # 只取 x,y
+        qx, qy, qz, qw  = env.root_states[0, 3:7].cpu().numpy()   # 方向四元数
+        #cal_yaw
+        siny_cosp = 2*(qw*qz + qx*qy)
+        cosy_cosp = 1 - 2*(qy*qy + qz*qz)
+        yaw_currrent = math.atan2(siny_cosp, cosy_cosp)
+        
+        dx = target_pos[0] - current_pos[0]
+        dy = target_pos[1] - current_pos[1]
+        yaw_target = math.atan2(dy, dx)
+        
+        dtheta = yaw_target - yaw_currrent
+        dtheta = (dtheta + math.pi) % (2*math.pi) - math.pi
+        error = target_pos - current_pos        # 2-dim 向量
+        dist  = np.linalg.norm(error)
+        
+        if abs(dtheta) > heading_thresh :
+            vx_cmd = 0.0
+            vy_cmd = 0.0
+            yaw_cmd = max(-1.0, min(1.0, dtheta*5))
+        else:
+        #cal_vel
+            if dist >arrive_tollerance:
+                vx_cmd=  dist/(dist+1) * max_speed
+                vy_cmd=0
+            else:
+                vx_cmd,vy_cmd = np.zeros(2, dtype=np.float32)  # 到了就停
+        
+        reset = False
+        
+        if dist <0.3 and dtheta <1.5:
+            vx_cmd=0
+            vy_cmd=0
+            yaw_cmd=0
+            print("arrive at target")
+            reset = True
+     
+            
+            
+            
+        vx = vx_cmd
+        vy = vy_cmd
+        yaw = yaw_cmd
 
         # —— 3. 更新命令
-        env.commands[:,0] = vx
-        env.commands[:,1] = vy
-        env.commands[:,2] = yaw
+        env.commands[:,0] = torch.tensor(vx)
+        env.commands[:,1] = torch.tensor(vy)
+        env.commands[:,2] = torch.tensor(yaw)
         env.commands[:,4] = height
 
         # —— 4. 推策略、步进仿真
         num_lower_dof = env.num_lower_dof
         actions = policy(obs.detach())
-        # print(obs.detach())
         actions[:, num_lower_dof:] = 0
-        print("actions: ",actions)
-        print(actions.shape)
-        # import pdb; pdb.set_trace()
-        obs, *_ = env.step(actions.detach())
+        obs, reward, _, done, *_ = env.step(actions.detach())
+        
+        if done[0] or reset:
+            env.gym.clear_lines(viewer)
+            coef = np.random.rand(2)*2-1
+            a = np.round(coef*5, decimals=1) 
+            target_pos = np.array([a[0], a[1]], dtype=np.float32)
+        
         actual_vx = env.base_lin_vel[0,0].item()
         actual_vy = env.base_lin_vel[0,1].item()
         current_height = env.root_states[0,2].item()
@@ -166,6 +256,22 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
         target_vy = vy
         target_height = height
         target_yaw = yaw
+
+        # env.root_states 是一个 (num_envs, 13) 的张量，
+        # 前 3 个元素是 [x, y, z]
+        current_pos_with_height = env.root_states[0, :3].cpu().numpy()    # 位置
+        # current__quat  = env.root_states[0, 3:7].cpu().numpy()   # 方向四元数
+        current_lin_v  = env.root_states[0, 7:10].cpu().numpy()  # 线速度
+        current_ang_v  = env.root_states[0, 10:13].cpu().numpy() # 角速度
+        
+
+
+        # print("current_pos",current_pos)
+
+        # print(obs.detach())
+        # print("actions: ",actions)
+        # print(actions.shape)
+        # import pdb; pdb.set_trace()
 
         # —— 6. 渲染文本
         lines = [
@@ -189,8 +295,8 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
 
 if __name__ == '__main__':
-    EXPORT_POLICY = True
+    EXPORT_POLICY = False
     RECORD_FRAMES = False
     MOVE_CAMERA = False
     args = get_args()
-    play(args, x_vel=0., y_vel=0., yaw_vel=0., height=0.5)
+    play(args, x_vel=0., y_vel=0., yaw_vel=0., height=0.75)
