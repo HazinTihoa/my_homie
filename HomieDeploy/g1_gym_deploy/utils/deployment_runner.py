@@ -45,7 +45,7 @@ class DeploymentRunner:
                 agent.get_obs()
                 joint_pos = agent.dof_pos[:12]
                 final_goal = np.array([-0.1000,  0.0000,  0.0000,  0.3000, -0.2000,  0.0000, -0.1000,  0.0000,
-                    0.0000,  0.3000, -0.2000,  0.0000], dtype=np.float)
+                    0.0000,  0.3000, -0.2000,  0.0000], dtype=np.float64)
 
                 print(f"About to calibrate; the robot will stand [Press R2 to calibrate]")
                 while wait:
