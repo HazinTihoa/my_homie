@@ -726,6 +726,10 @@ class LeggedRobot(BaseTask):
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
         self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
+        
+        self.actor_jacobian = self.gym.acquire_jacobian_tensor(self.sim, self.cfg.asset.name)
+
+        self.whole_jac = gymtorch.wrap_tensor(self.actor_jacobian) 
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
