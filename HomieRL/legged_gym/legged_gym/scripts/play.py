@@ -30,7 +30,7 @@
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 import os
-import keyboard 
+
 import onnxruntime as ort
 import pygame
 import isaacgym

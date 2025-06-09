@@ -89,7 +89,8 @@ export LD_LIBRARY_PATH=path_to_miniconda3/envs/homierl/lib:$LD_LIBRARY_PATH
 ### Play
 Once you train a policy, you can first set the [resume_path](https://github.com/OpenRobotLab/HomieRL/blob/main/legged_gym/legged_gym/utils/task_registry.py#L6) to the path of your checkpoint, and run the command below:
 ```
-python legged_gym/legged_gym/scripts/play.py --num_envs 32 --task g1 --resume
+python legged_gym/legged_gym/scripts/play.py --num_envs 1 --task g1 --resume --rl_device cpu --sim_device cpu
+python legged_gym/legged_gym/scripts/play_data_collect.py --num_envs 1 --task g1 --resume --rl_device cpu --sim_device cpu
 ```
 Then you can view the performance of your trained policy.
 ### Export Policy
