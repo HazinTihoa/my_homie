@@ -65,7 +65,7 @@ def solve_right_arm_ik_jacobian(
     env.gym.refresh_jacobian_tensors(env.sim)
     whole_jac = gymtorch.wrap_tensor(actor_jacobian)
     j_eef = whole_jac[env_idx, wrist_body_index, :6, arm_joint_indices]  # [6,7]，Tensorprin
-
+    print("j_eef:", j_eef.shape, j_eef)
     dpos = torch.zeros(6, device=device)  # 构建 dpose = [pos_err; zeros(3)]，并转成 Tensor (6,1)
     dpos[0:3] = torch.from_numpy(pos_err).to(device).float()
     dpose = dpos.unsqueeze(-1)  # [6,1]     # orientation 误差置 0（不关心姿态）
@@ -77,7 +77,7 @@ def solve_right_arm_ik_jacobian(
     reg = torch.eye(6, device=device) * lambda_sq  # [6,6]
     inv_term = torch.inverse(JJT + reg)  # [6,6]
     dq = (J.T @ inv_term @ dpose).squeeze(-1)  # [7]
-    q_new = q_init + dq.cpu().numpy() * 1  # numpy (7,)
+    q_new = q_init + dq.cpu().numpy() * 0.2  # numpy (7,)
     return q_new, err_norm
 
 
@@ -104,6 +104,15 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+    
+    # Acquire rigid body state tensor
+    # This tensor is populated by the simulation state
+    _rb_states = env.gym.acquire_rigid_body_state_tensor(env.sim)
+    # Wrap the tensor so we can use it with PyTorch
+    rb_states_pt = gymtorch.wrap_tensor(_rb_states) # Shape: (num_envs * num_bodies_per_env, 13)
+    # Get the number of rigid bodies per robot asset
+    num_links_per_robot = env.num_bodies 
+
     env.commands[:, 0] = x_vel
     env.commands[:, 1] = y_vel
     env.commands[:, 2] = yaw_vel
@@ -119,6 +128,11 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     policy = ppo_runner.get_inference_policy(
         device=env.device
     )  # Use this to load from trained pt file
+
+    # Initialize rigid body state tensor
+    _rb_states = env.gym.acquire_rigid_body_state_tensor(env.sim)
+    rb_states_pt = gymtorch.wrap_tensor(_rb_states) # (num_envs * num_links_per_robot, 13)
+    num_links_per_robot = env.num_bodies # Assuming env.num_bodies gives the number of links per robot
 
     # init upper body joint
     waist_yaw_joint = torch.zeros(env.num_envs, 1, device=env.device)  # (B,1)
@@ -169,202 +183,185 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     for i in range(B):
         draw_target_cross(env, viewer, target_pos[i,:])
 
-    for _ in range(30 * int(env.max_episode_length)):
-        gym = env.gym
-        env_handle = env.envs[0]  # 这里只取第 0 个并行环境
-        actor = actor_handle  # 你之前已拿到的 actor_handle
-        rb_states = gym.get_actor_rigid_body_states(env_handle, actor, gymapi.STATE_ALL)
-        shoulder_state = rb_states[rb_shoulder_index]
-        pos_w = shoulder_state[0][0]
-        rot_w = shoulder_state[0][1]
+    # --- 数据采集：初始化 ---
+    # 用于存储每个时间帧收集到的数据字典列表
+    collected_frames_data = [] 
+    # --- 数据采集：结束初始化 ---
+    try:
+        for _ in range(30 * int(env.max_episode_length)):
+            gym = env.gym
+            env_handle = env.envs[0]  # 这里只取第 0 个并行环境
+            actor = actor_handle  # 你之前已拿到的 actor_handle
+            # The following lines for single actor rb_states are not needed for batched collection
+            # rb_states = gym.get_actor_rigid_body_states(env_handle, actor, gymapi.STATE_ALL)
+            # shoulder_state = rb_states[rb_shoulder_index]
+            # pos_w = shoulder_state[0][0]
+            # rot_w = shoulder_state[0][1]
+            fps = clock.get_fps()
 
+            current_pos_xy = env.root_states[:, :2]  # 只取 x,y
+            qx, qy, qz, qw = env.root_states[:, 3:7].unbind(dim=1)  # 快速拆 4 列，各 (B,)
+            # cal_yaw
+            siny_cosp = 2 * (qw * qz + qx * qy)
+            cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+            yaw_currrent = torch.atan2(siny_cosp, cosy_cosp)
 
+            target_pos_xy = target_pos[:, :2]  # 只取 x,y
+            dx = target_pos_xy[:, 0] - current_pos_xy[:, 0]
+            dy = target_pos_xy[:, 1] - current_pos_xy[:, 1]
 
-        # Calculate and display FPS
-        fps = clock.get_fps()
+            yaw_target = torch.atan2(dy, dx)
+            dtheta = torch.atan2(torch.sin(yaw_target - yaw_currrent), torch.cos(yaw_target - yaw_currrent))
+            dist = torch.linalg.norm(target_pos_xy - current_pos_xy, dim=1)
 
-        reset = False
-        current_pos_xy = env.root_states[:, :2]  # 只取 x,y
-        qx, qy, qz, qw = env.root_states[:, 3:7].unbind(dim=1)  # 快速拆 4 列，各 (B,)
-        # cal_yaw
-        siny_cosp = 2 * (qw * qz + qx * qy)
-        cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
-        yaw_currrent = torch.atan2(siny_cosp, cosy_cosp)
+            device = env.device
+            dist_ratio = dist / (dist + 1.0)
+            vx_nominal = dist_ratio * max_speed                    # (B,)
+            yaw      = torch.clamp(dtheta * 3.0, -1.0, 1.0)
+            height_tar = torch.clamp(target_pos[:, 2], 0.3, 0.8)   # (B,)
+            idle_height = torch.full((B,), 0.75, device=device)
 
-        target_pos_xy = target_pos[:, :2]  # 只取 x,y
-        dx = target_pos_xy[:, 0] - current_pos_xy[:, 0]
-        dy = target_pos_xy[:, 1] - current_pos_xy[:, 1]
+            need_turn     = (torch.abs(dtheta) > heading_thresh)      # (B,)
+            need_approach = (dist > arrive_tollerance)                       # (B,)
+            no_need_turn   = torch.abs(dtheta) < heading_thresh+0.2
+            no_need_approach = ~need_approach
 
-        yaw_target = torch.atan2(dy, dx)
+            yaw_cmd  = torch.where(need_turn, yaw, torch.zeros_like(yaw))
+            vx_cmd  = torch.where(need_approach, vx_nominal,torch.zeros_like(vx_nominal))
+            height_cmd  = torch.where(no_need_turn&no_need_approach,  height_tar, idle_height)
+            
+            pos_z     = env.root_states[:, 2]      # (B, 1)所有机器人的 (z)
+            eps          = 5e-2
+            no_need_height =torch.abs(pos_z - height_cmd) < eps
 
-        dtheta = torch.atan2(
-            torch.sin(yaw_target - yaw_currrent), torch.cos(yaw_target - yaw_currrent)
-        )
+            need_arm_ik=torch.where(no_need_turn&no_need_approach&no_need_height,True,False) 
 
-        dist = torch.linalg.norm(target_pos_xy - current_pos_xy, dim=1)
+            ik_cal_idx  = torch.nonzero(need_arm_ik).squeeze(1)  # (k,)
 
+            if ik_cal_idx.numel():
+                n= ik_cal_idx.numel()
+                for env_idx in ik_cal_idx:
+                    target_pos_ik = target_pos[env_idx, :].cpu().numpy()  # 之后转为gpu计算
 
+                    dof_states = gym.get_actor_dof_states(env.envs[0], env.actor_handles[0], gymapi.STATE_POS)
+                    right_arm_pos = dof_states["pos"][20:27]
+                    q_init_7dof = right_arm_pos #current arm joint position
 
-        device = env.device
-        dist_ratio = dist / (dist + 1.0)
-        vx_nominal = dist_ratio * max_speed                    # (B,)
-        yaw      = torch.clamp(dtheta * 3.0, -1.0, 1.0)
-        height_tar = torch.clamp(target_pos[:, 2], 0.3, 0.8)   # (B,)
-        idle_height = torch.full((B,), 0.75, device=device)
+                    q_new, err_norm = solve_right_arm_ik_jacobian(
+                            env,
+                            env_idx,
+                            env.actor_handles[env_idx],
+                            rb_wrist_index,
+                            arm_joint_indices,
+                            target_pos_ik,
+                            q_init_7dof,
+                        )  #  arm joint get
+                    print("q_new:", q_new)
+                    right_arm_joint[env_idx,:] = torch.tensor(q_new, dtype=torch.float32) * 4
+                    err_norms[env_idx]= err_norm
+                    if err_norms[env_idx] < arm_end_target_err:
+                        need_reset[env_idx] = True
+            else:
+                err_norms[:] = float('inf')
 
-        # --- masks ---
-        need_turn     = (torch.abs(dtheta) > heading_thresh)      # (B,)
-        need_approach = (dist > arrive_tollerance)                       # (B,)
-        no_need_turn   = torch.abs(dtheta) < heading_thresh+0.2
-        no_need_approach = ~need_approach
-        # --- yaw ---
+            env.commands[:, 0] = vx_cmd
+            env.commands[:, 1] = torch.zeros(B, dtype=torch.float32)
+            env.commands[:, 2] = yaw_cmd
+            env.commands[:, 4] = height_cmd  # height
 
-        #if need turn：
-        yaw_cmd  = torch.where(need_turn, yaw, torch.zeros_like(yaw))
-        # if need turn and need approach：
+            actions = policy(obs.detach())
+            left_arm_joint = left_arm_joint.view(B, -1)
+            right_arm_joint = right_arm_joint.view(B, -1)
+            waist_yaw_joint = waist_yaw_joint.view(B, -1)
+            actions = torch.cat([actions, waist_yaw_joint, left_arm_joint, right_arm_joint], dim=1)
+            obs, reward, _, done, *_ = env.step(actions.detach())  # reset中也会调用
 
-        vx_cmd  = torch.where(need_approach, vx_nominal,torch.zeros_like(vx_nominal))
+            # Refresh rigid body state tensor
+            env.gym.refresh_rigid_body_state_tensor(env.sim)
 
+            reset_ids  = torch.nonzero(need_reset).squeeze(1)  # (k,)
+            if reset_ids.numel():
+                print("resetting:")
+                # env.reset_idx(reset_ids.cpu())        # 物理重置
+                n= reset_ids.numel()
+                right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32)
+                height_cmd[reset_ids]     = 0.75
+                target_pos[reset_ids, 2] = torch.rand(n, device=device)*0.2+0.9  # height
+                target_pos[reset_ids, :2] = torch.rand(n, 2, device=device) * 3 - 1.5# x,y
+                target_pos[reset_ids, 0] += pos_xyz[reset_ids, 0]  # x
+                target_pos[reset_ids, 1] += pos_xyz[reset_ids, 1]  # y
+                need_reset[reset_ids] = False    # 重置后不再满足“到达”条件   
+                env.gym.clear_lines(viewer)
+                for i in range(B):
+                    draw_target_cross(env, viewer, target_pos[i,:])
+            clock.tick(60)
+            
+            # ------- 数据采集与处理（在 env.step() 之后）--------
+            # --- 数据采集：获取时间戳 ---
+            wall_time_current = time.time()  # Unix 时间戳
+            sim_time_current = env.gym.get_sim_time(env.sim)  # 仿真时间
+            # --- 数据采集：结束获取时间戳 ---
 
-        height_cmd  = torch.where(no_need_turn&no_need_approach,  height_tar, idle_height)
-        
-        pos_z     = env.root_states[:, 2]      # (B, 1)所有机器人的 (z)
-        eps          = 5e-2
-        no_need_height =torch.abs(pos_z - height_cmd) < eps
+            # --- 数据采集：存储当前帧数据 ---
+            # 注意：所有PyTorch张量在存入前都通过 .clone().cpu().numpy() 转换为NumPy数组
+            frame_data = {
+                'sim_time': sim_time_current,  # 当前仿真时间 (标量)
+                'wall_time': wall_time_current, # 当前墙上时间 (标量)
+                'root_states': env.root_states.clone().cpu().numpy(),      # 基座状态 (B, 13)
+                'dof_pos': env.dof_pos.clone().cpu().numpy(),              # 关节角度 (B, num_dof)
+                'dof_vel': env.dof_vel.clone().cpu().numpy(),              # 关节速度 (B, num_dof)
+                # MODIFICATION: Detach actions tensor before converting to numpy
+                'applied_actions': actions.clone().detach().cpu().numpy(),          # 应用的动作 (B, num_actions_total)
+                'current_target_pos': target_pos.clone().cpu().numpy(),    # 当前目标位置 (B, 3)
+                'ik_err_norms': err_norms.clone().cpu().numpy(),           # IK误差范数 (B,)
+                'base_commands': env.commands.clone().cpu().numpy(),       # 基座指令 (B, num_base_commands)
+                'done_flags': done.clone().cpu().numpy(),                  # 环境done标志 (B,)
+                'need_reset_flags_eval': need_reset.clone().cpu().numpy(),  # 评估时的need_reset标志 (B,)
+                # ADDED: Collect all link states
+                'link_positions': rb_states_pt.view(env.num_envs, num_links_per_robot, 13)[:, :, 0:3].clone().detach().cpu().numpy(), # (B, num_links, 3)
+                'link_linear_velocities': rb_states_pt.view(env.num_envs, num_links_per_robot, 13)[:, :, 7:10].clone().detach().cpu().numpy(), # (B, num_links, 3)
+                'link_angular_velocities': rb_states_pt.view(env.num_envs, num_links_per_robot, 13)[:, :, 10:13].clone().detach().cpu().numpy() # (B, num_links, 3)
+            }
+            collected_frames_data.append(frame_data)
+            # --- 数据采集：结束存储当前帧数据 ---
+        # ------- 数据采集与处理结束 --------
+    # 仿真主循环结束
+    finally:
+        # --- 数据采集：处理并保存所有收集的数据 ---
+        if collected_frames_data:
+            collated_data = {}
+            # 从第一帧获取键名，假设所有帧结构相同
+            # 这些键对应每帧变化的标量数据
+            data_keys_per_frame_scalar = ['sim_time', 'wall_time']
+            # 这些键对应每帧变化的、带批量维度B的数据
+            # MODIFICATION: Add new keys for link states
+            data_keys_per_frame_batched = ['root_states', 'dof_pos', 'dof_vel', 'applied_actions', 
+                                        'current_target_pos', 'ik_err_norms', 'base_commands', 
+                                        'done_flags', 'need_reset_flags_eval',
+                                        'link_positions', 'link_linear_velocities', 'link_angular_velocities']
 
-        need_arm_ik=torch.where(no_need_turn&no_need_approach&no_need_height,True,False) 
+            for key in data_keys_per_frame_scalar:
+                collated_data[key] = np.array([frame[key] for frame in collected_frames_data])
+                # 结果形状: (num_timesteps,)
 
-        ik_cal_idx  = torch.nonzero(need_arm_ik).squeeze(1)  # (k,)
+            for key in data_keys_per_frame_batched:
+                # 沿新的时间维度 (axis 0) 堆叠
+                collated_data[key] = np.stack([frame[key] for frame in collected_frames_data], axis=0)
+                # 结果形状: (num_timesteps, B, num_features_for_key)
 
-        if ik_cal_idx.numel():
-            n= ik_cal_idx.numel()
-            for env_idx in ik_cal_idx:
-                target_pos_ik = target_pos[env_idx, :].cpu().numpy()  # 之后转为gpu计算
-
-                dof_states = gym.get_actor_dof_states(env.envs[0], env.actor_handles[0], gymapi.STATE_POS)
-                right_arm_pos = dof_states["pos"][20:27]
-                q_init_7dof = right_arm_pos #current arm joint position
-
-                q_new, err_norm = solve_right_arm_ik_jacobian(
-                        env,
-                        env_idx,
-                        env.actor_handles[env_idx],
-                        rb_wrist_index,
-                        arm_joint_indices,
-                        target_pos_ik,
-                        q_init_7dof,
-                    )  #  arm joint get
-                right_arm_joint[env_idx,:] = torch.tensor(q_new, dtype=torch.float32) * 4
-                err_norms[env_idx]= err_norm
-                if err_norms[env_idx] < arm_end_target_err:
-                    need_reset[env_idx] = True
+            # --- 数据采集：定义文件名并保存 ---
+            # LEGGED_GYM_ROOT_DIR, os, time, np 应该已在文件顶部导入
+            output_dir = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', 'collected_data_play')
+            os.makedirs(output_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            data_filename = os.path.join(output_dir, f"homie_play_data_{timestamp}.npz")
+            
+            np.savez_compressed(data_filename, **collated_data)
+            print(f"收集的数据已保存到: {data_filename}")
+            # --- 数据采集：结束定义文件名并保存 ---
         else:
-            err_norms[:] = float('inf')
-
-    
-
-        
-        # if abs(dtheta) > heading_thresh:
-        #     yaw_cmd = max(-1.0, min(1.0, dtheta * 2))
-        #     if dist > arrive_tollerance:
-        #         vx_cmd = dist / (dist + 1) * max_speed
-        #     else:
-        #         vx_cmd = np.zeros(1, dtype=np.float32)  # 到了就停
-        # else:
-        #     vx_cmd = dist / (dist + 1) * max_speed
-
-        # if dist < 0.3:
-        #     vx_cmd = 0
-        #     if dtheta < 0.2:
-        #         height_cmd = max(0.4, min(0.9, target_pos[2]))
-        #         yaw_cmd = 0
-        #         q_new, err_norm = solve_right_arm_ik_jacobian(
-        #             env,
-        #             env_handle,
-        #             actor_handle,
-        #             rb_wrist_index,
-        #             arm_joint_indices,
-        #             target_pos,
-        #             q_init_7dof,
-        #         )  #  arm joint get
-        #         right_arm_joint = torch.tensor(q_new, dtype=torch.float32) * 4
-        #         if err_norm < 0.1:
-        #             reset = True
-        #             print("arrive at target")
-        #     else:
-        #         yaw_cmd = max(-1.0, min(1.0, dtheta * 2))
-
-        # right_arm_joint = torch.zeros(B,7,dtype=torch.float32)
-
-
-        env.commands[:, 0] = vx_cmd
-        env.commands[:, 1] = torch.zeros(B, dtype=torch.float32)
-        env.commands[:, 2] = yaw_cmd
-        env.commands[:, 4] = height_cmd  # height
-
-        actions = policy(obs.detach())
-
-        left_arm_joint = left_arm_joint.view(B, -1)
-        right_arm_joint = right_arm_joint.view(B, -1)
-        waist_yaw_joint = waist_yaw_joint.view(B, -1)
-        actions = torch.cat([actions, waist_yaw_joint, left_arm_joint, right_arm_joint], dim=1)
-
-        obs, reward, _, done, *_ = env.step(actions.detach())  # reset中也会调用
-
-
-
-        reset_ids  = torch.nonzero(need_reset).squeeze(1)  # (k,)
-
-        if reset_ids.numel():
-            print("resetting====================================:")
-            # env.reset_idx(reset_ids.cpu())        # 物理重置
-            n= reset_ids.numel()
-            right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32)
-            height_cmd[reset_ids]     = 0.75
-
-            target_pos[reset_ids, 2] = torch.rand(n, device=device)+0.3  # height
-            target_pos[reset_ids, :2] = torch.rand(n, 2, device=device) * 3 - 1.5# x,y
-            target_pos[reset_ids, 0] += pos_xyz[reset_ids, 0]  # x
-            target_pos[reset_ids, 1] += pos_xyz[reset_ids, 1]  # y
-
-            need_reset[reset_ids] = False    # 重置后不再满足“到达”条件   
-            env.gym.clear_lines(viewer)
-            for i in range(B):
-                draw_target_cross(env, viewer, target_pos[i,:])
-                
-
-        clock.tick(60)
-        # ------- 数据采样与打印（插在 env.step() 之后）---------------------------------------------------------------------------------------------
-        wall_time = time.time()  # Unix 时间戳
-        sim_time = env.gym.get_sim_time(env.sim)  # 仿真时间
-        fps_val = clock.get_fps()  # 实时 FPS
-        # print("fps:",fps_val)
-
-        # base（机体）13 维：pos(3) + quat(4) + lin_vel(3) + ang_vel(3)
-        # 全批量张量保留在 GPU（建议）
-        # root = env.root_states          # shape = (B, 13)，B = 并行环境数
-
-        # pos_xyz     = root[:, 0:3]      # (B, 3)  所有机器人的 (x,y,z)
-        # quat_xyzw   = root[:, 3:7]      # (B, 4)  (qx,qy,qz,qw)
-        # lin_vel_xyz = root[:, 7:10]     # (B, 3)  线速度
-        # ang_vel_xyz = root[:, 10:13]    # (B, 3)  角速度
-
-
-        # 关节 v w
-        dof_states = env.gym.get_actor_dof_states(
-            env_handle, actor_handle, gymapi.STATE_ALL
-        )
-
-        q = dof_states["pos"]  # 关节角
-        qd = dof_states["vel"]  # 关节速度
-
-        link_states = env.gym.get_actor_rigid_body_states(
-            env_handle, actor_handle, gymapi.STATE_POS | gymapi.STATE_VEL
-        )
-        # positions = link_states["pos"]                  # 关节位置
-        # velocities = link_states["vel"]                 # 关节速度
-
-
+            print("没有收集到数据可供保存。")
+    # --- 数据采集：处理并保存所有收集的数据结束 ---
 
 if __name__ == "__main__":
     args = get_args()
