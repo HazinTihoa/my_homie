@@ -50,10 +50,19 @@ def solve_right_arm_ik_jacobian(
 ):
 
     device = env.device  
-    rb_states_np = env.gym.get_actor_rigid_body_states(
-         env.envs[env_idx], actor_handle, gymapi.STATE_ALL
-    )
-    pos_w = rb_states_np[wrist_body_index][0][0]  # (px, py, pz)
+    # rb_states_np = env.gym.get_actor_rigid_body_states(
+    #      env.envs[env_idx], actor_handle, gymapi.STATE_ALL
+    # )
+    # pos_w = rb_states_np[wrist_body_index][0][0]  # (px, py, pz)
+
+    rb_state_tensor = env.gym.acquire_rigid_body_state_tensor(env.sim)   # 原始 GPU 缓冲区
+    env.gym.refresh_rigid_body_state_tensor(env.sim)                    # VERY IMPORTANT!
+    rb_states = gymtorch.wrap_tensor(rb_state_tensor)           # 形状: (num_envs * num_bodies, 13)
+    num_envs   = env.num_envs            # 例如 32
+    rb_states = rb_states.view(num_envs, -1, 13)
+    pos_w = rb_states[env_idx, wrist_body_index, 0:3] 
+
+
     cur_wrist_pos = np.array([pos_w[0], pos_w[1], pos_w[2]], dtype=np.float64)
     pos_err = target_pos - cur_wrist_pos  # numpy (3,) current - target error vector
     err_norm = np.linalg.norm(pos_err) # error norm
@@ -243,9 +252,16 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 for env_idx in ik_cal_idx:
                     target_pos_ik = target_pos[env_idx, :].cpu().numpy()  # 之后转为gpu计算
 
-                    dof_states = gym.get_actor_dof_states(env.envs[0], env.actor_handles[0], gymapi.STATE_POS)
-                    right_arm_pos = dof_states["pos"][20:27]
-                    q_init_7dof = right_arm_pos #current arm joint position
+                    # dof_states = gym.get_actor_dof_states(env.envs[env_idx], env.actor_handles[env_idx], gymapi.STATE_POS)
+                    # right_arm_pos = dof_states["pos"][20:27]
+                    # q_init_7dof = right_arm_pos #current arm joint position
+
+                    dof_states = gym.acquire_dof_state_tensor(env.sim)
+                    dof_state_tensor = gymtorch.wrap_tensor(dof_states)
+                    gym.refresh_dof_state_tensor(env.sim)          # ← 一定别忘了刷新！
+                    dof_state_tensor = dof_state_tensor.view(env.num_envs,-1 ,2)
+                    print(dof_state_tensor,dof_state_tensor.shape) 
+                    q_init_7dof = dof_state_tensor[env_idx, 20:27, 0] 
 
                     q_new, err_norm = solve_right_arm_ik_jacobian(
                             env,
