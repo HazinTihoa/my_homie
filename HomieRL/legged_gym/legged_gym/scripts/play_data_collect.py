@@ -50,10 +50,16 @@ def solve_right_arm_ik_jacobian(
 ):
 
     device = env.device  
-    rb_states_np = env.gym.get_actor_rigid_body_states(
-         env.envs[env_idx], actor_handle, gymapi.STATE_ALL
-    )
-    pos_w = rb_states_np[wrist_body_index][0][0]  # (px, py, pz)
+    # rb_states_np = env.gym.get_actor_rigid_body_states(
+    #      env.envs[env_idx], actor_handle, gymapi.STATE_ALL
+    # )
+    # pos_w = rb_states_np[wrist_body_index][0][0]  # (px, py, pz)
+    rb_state_tensor = env.gym.acquire_rigid_body_state_tensor(env.sim)   # 原始 GPU 缓冲区
+    env.gym.refresh_rigid_body_state_tensor(env.sim)                    # VERY IMPORTANT!
+    rb_states = gymtorch.wrap_tensor(rb_state_tensor)           # 形状: (num_envs * num_bodies, 13)
+    num_envs   = env.num_envs            # 例如 32
+    rb_states = rb_states.view(num_envs, -1, 13)
+    pos_w = rb_states[env_idx, wrist_body_index, 0:3].cpu()
     cur_wrist_pos = np.array([pos_w[0], pos_w[1], pos_w[2]], dtype=np.float64)
     pos_err = target_pos - cur_wrist_pos  # numpy (3,) current - target error vector
     err_norm = np.linalg.norm(pos_err) # error norm
@@ -65,7 +71,7 @@ def solve_right_arm_ik_jacobian(
     env.gym.refresh_jacobian_tensors(env.sim)
     whole_jac = gymtorch.wrap_tensor(actor_jacobian)
     j_eef = whole_jac[env_idx, wrist_body_index, :6, arm_joint_indices]  # [6,7]，Tensorprin
-    print("j_eef:", j_eef.shape, j_eef)
+    # print("j_eef:", j_eef.shape, j_eef)
     dpos = torch.zeros(6, device=device)  # 构建 dpose = [pos_err; zeros(3)]，并转成 Tensor (6,1)
     dpos[0:3] = torch.from_numpy(pos_err).to(device).float()
     dpose = dpos.unsqueeze(-1)  # [6,1]     # orientation 误差置 0（不关心姿态）
@@ -77,7 +83,7 @@ def solve_right_arm_ik_jacobian(
     reg = torch.eye(6, device=device) * lambda_sq  # [6,6]
     inv_term = torch.inverse(JJT + reg)  # [6,6]
     dq = (J.T @ inv_term @ dpose).squeeze(-1)  # [7]
-    q_new = q_init + dq.cpu().numpy() * 0.2  # numpy (7,)
+    q_new = q_init.cpu() + dq.cpu().numpy() * 0.2  # numpy (7,)
     return q_new, err_norm
 
 
@@ -149,9 +155,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
 
 
-    # env.reset_idx(torch.arange(env.num_envs).to("cuda:0"))
-    cpu_inds = torch.arange(env.num_envs, dtype=torch.int32)
-    env.reset_idx(cpu_inds)
+    device = env.device
+    env.reset_idx(torch.arange(env.num_envs).to("cuda:0"))
+    # cpu_inds = torch.arange(env.num_envs, dtype=torch.int32)
+    # env.reset_idx(cpu_inds)
 
 
     arrive_tollerance = 0.3  # pos tollerance
@@ -164,10 +171,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     B      = env.num_envs
 
     torch.manual_seed(42)  # 这里设置种子为42
-    target_pos = torch.empty(B, 3)
-
+    target_pos = torch.empty(B, 3).to(device)
     root = env.root_states          # shape = (B, 13)，B = 并行环境数
-    pos_xyz     = root[:, 0:3].clone()      # (B, 3)  所有机器人的 (x,y,z)
+    # pos_xyz     = root[:, 0:3].clone()      # (B, 3)  所有机器人的 (x,y,z)
+    pos_xyz = root[:, 0:3].clone().to(device)
     target_pos[:, :2] = torch.rand(B, 2) * 3 - 1.5# x,y
     #每个机器人中心作为目标范围的中心
     target_pos[:, 0] += pos_xyz[:, 0]  # x
@@ -198,7 +205,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             # pos_w = shoulder_state[0][0]
             # rot_w = shoulder_state[0][1]
             fps = clock.get_fps()
-
+            print("fps: ",fps)
             current_pos_xy = env.root_states[:, :2]  # 只取 x,y
             qx, qy, qz, qw = env.root_states[:, 3:7].unbind(dim=1)  # 快速拆 4 列，各 (B,)
             # cal_yaw
@@ -207,14 +214,14 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             yaw_currrent = torch.atan2(siny_cosp, cosy_cosp)
 
             target_pos_xy = target_pos[:, :2]  # 只取 x,y
-            dx = target_pos_xy[:, 0] - current_pos_xy[:, 0]
-            dy = target_pos_xy[:, 1] - current_pos_xy[:, 1]
+            dx = target_pos_xy[:, 0].to(device) - current_pos_xy[:, 0].to(device)
+            dy = target_pos_xy[:, 1].to(device) - current_pos_xy[:, 1].to(device)
 
             yaw_target = torch.atan2(dy, dx)
             dtheta = torch.atan2(torch.sin(yaw_target - yaw_currrent), torch.cos(yaw_target - yaw_currrent))
             dist = torch.linalg.norm(target_pos_xy - current_pos_xy, dim=1)
 
-            device = env.device
+
             dist_ratio = dist / (dist + 1.0)
             vx_nominal = dist_ratio * max_speed                    # (B,)
             yaw      = torch.clamp(dtheta * 3.0, -1.0, 1.0)
@@ -242,10 +249,19 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 n= ik_cal_idx.numel()
                 for env_idx in ik_cal_idx:
                     target_pos_ik = target_pos[env_idx, :].cpu().numpy()  # 之后转为gpu计算
+        
+                    dof_states = gym.acquire_dof_state_tensor(env.sim)
+                    dof_state_tensor = gymtorch.wrap_tensor(dof_states)
+                    gym.refresh_dof_state_tensor(env.sim)          # ← 一定别忘了刷新！
+                    dof_state_tensor = dof_state_tensor.view(env.num_envs,-1 ,2)
+                    q_init_7dof = dof_state_tensor[env_idx, 20:27, 0] 
 
-                    dof_states = gym.get_actor_dof_states(env.envs[0], env.actor_handles[0], gymapi.STATE_POS)
-                    right_arm_pos = dof_states["pos"][20:27]
-                    q_init_7dof = right_arm_pos #current arm joint position
+                    # rigid_body_states = gym.acquire_rigid_body_state_tensor(env.sim)
+   
+
+                    # dof_states = gym.get_actor_dof_states(env.envs[env_idx], env.actor_handles[env_idx], gymapi.STATE_POS)
+                    # right_arm_pos = dof_states["pos"][20:27]
+                    # q_init_7dof = right_arm_pos #current arm joint position
 
                     q_new, err_norm = solve_right_arm_ik_jacobian(
                             env,
@@ -256,7 +272,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                             target_pos_ik,
                             q_init_7dof,
                         )  #  arm joint get
-                    print("q_new:", q_new)
+                    # print("q_new:", q_new)
                     right_arm_joint[env_idx,:] = torch.tensor(q_new, dtype=torch.float32) * 4
                     err_norms[env_idx]= err_norm
                     if err_norms[env_idx] < arm_end_target_err:
@@ -284,7 +300,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 print("resetting:")
                 # env.reset_idx(reset_ids.cpu())        # 物理重置
                 n= reset_ids.numel()
-                right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32)
+                right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32,device=device)
                 height_cmd[reset_ids]     = 0.75
                 target_pos[reset_ids, 2] = torch.rand(n, device=device)*0.2+0.9  # height
                 target_pos[reset_ids, :2] = torch.rand(n, 2, device=device) * 3 - 1.5# x,y
