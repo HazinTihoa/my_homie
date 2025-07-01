@@ -114,22 +114,24 @@ class LeggedRobot(BaseTask):
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
         clip_actions = self.cfg.normalization.clip_actions
-        # if (self.common_step_counter % self.cfg.domain_rand.upper_interval == 0):
-        #     # (NOTE) implementation of upper-body curriculum
-        #     self.random_upper_ratio = min(self.action_curriculum_ratio, 1.0)
-        #     uu = torch.rand(self.num_envs, self.num_actions - self.num_lower_dof, device=self.device)
-        #     self.random_upper_ratio = -1.0 / (20 * (1-self.random_upper_ratio*0.99))*torch.log(1 - uu + uu * np.exp(-20 * (1-self.random_upper_ratio*0.99)))
+        if (self.common_step_counter % self.cfg.domain_rand.upper_interval == 0):
+            # (NOTE) implementation of upper-body curriculum
+            self.random_upper_ratio = min(self.action_curriculum_ratio, 1.0)
+            uu = torch.rand(self.num_envs, self.num_actions - self.num_lower_dof, device=self.device)
+            self.random_upper_ratio = -1.0 / (20 * (1-self.random_upper_ratio*0.99))*torch.log(1 - uu + uu * np.exp(-20 * (1-self.random_upper_ratio*0.99)))
             
-        #     self.random_joint_ratio = self.random_upper_ratio * torch.rand(self.num_envs, self.num_actions - self.num_lower_dof).to(self.device)
-        #     rand_pos = torch.rand(self.num_envs, self.num_actions - self.num_lower_dof, device=self.device) - 0.5
-        #     self.random_upper_actions = ((self.action_min[:, self.num_lower_dof:] * (rand_pos >= 0)) + (self.action_max[:, self.num_lower_dof:] * (rand_pos < 0) ))* self.random_joint_ratio
-        #     self.delta_upper_actions = (self.random_upper_actions - self.current_upper_actions) / (self.cfg.domain_rand.upper_interval)
+            self.random_joint_ratio = self.random_upper_ratio * torch.rand(self.num_envs, self.num_actions - self.num_lower_dof).to(self.device)
+            rand_pos = torch.rand(self.num_envs, self.num_actions - self.num_lower_dof, device=self.device) - 0.5
+            self.random_upper_actions = ((self.action_min[:, self.num_lower_dof:] * (rand_pos >= 0)) + (self.action_max[:, self.num_lower_dof:] * (rand_pos < 0) ))* self.random_joint_ratio
+            self.delta_upper_actions = (self.random_upper_actions - self.current_upper_actions) / (self.cfg.domain_rand.upper_interval)
             
-        # self.current_upper_actions += self.delta_upper_actions
-        # self.current_upper_actions[:] = 1.
-        # print("current_upper_actions:",self.current_upper_actions,self.current_upper_actions.shape)
+        self.current_upper_actions += self.delta_upper_actions
+        self.current_upper_actions[:] = 1.
+        
+        # print("current_upper_actions:",self.current_upper_actions.shape)
+        # print("actions:",actions.shape)
         # actions = torch.cat((actions, self.current_upper_actions), dim=-1)
-        # print("actions:",actions,actions.shape)
+        # print("actions:",actions.shape)
 
         
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device) 
@@ -206,7 +208,7 @@ class LeggedRobot(BaseTask):
 
         # compute observations, rewards, resets, ...
         self.check_termination()
-        self.compute_reward()
+        # self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         termination_privileged_obs = self.compute_termination_observations(env_ids)
         self.reset_idx(env_ids)

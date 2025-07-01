@@ -91,6 +91,7 @@ Once you train a policy, you can first set the [resume_path](https://github.com/
 ```
 python legged_gym/legged_gym/scripts/play.py --num_envs 1 --task g1 --resume --rl_device cpu --sim_device cpu
 python legged_gym/legged_gym/scripts/play_data_collect.py --num_envs 1 --task g1 --resume --rl_device cpu --sim_device cpu
+python legged_gym/legged_gym/scripts/play_data_collect.py --num_envs 1 --task g1 --resume --rl_device cuda:0 --sim_device cuda:0
 ```
 Then you can view the performance of your trained policy.
 ### Export Policy

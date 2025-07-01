@@ -30,11 +30,11 @@
 
 import os
 import copy
-import torch
 import numpy as np
 import random
 from isaacgym import gymapi
 from isaacgym import gymutil
+import torch
 import torch.nn.functional as F
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
@@ -172,7 +172,13 @@ def get_args():
     args = gymutil.parse_arguments(
         description="RL Policy",
         custom_parameters=custom_parameters)
+    args.rl_device = "cuda:0" 
+    args.task = "g1"
+    args.resume = True 
 
+    # args.num_envs = 1
+    # args.headless = False
+    
     # name allignment
     # args.sim_device_id = args.compute_device_id
     args.sim_device = args.rl_device
