@@ -9,8 +9,22 @@ import torch
 
 from isaacgym import gymapi
 from isaacgym import gymtorch
+from isaacgym import gymutil
 import torch.nn.functional as F
 import h5py
+
+# --- add LidarSensor to sys.path (manual path) ---
+import sys, os
+LIDAR_PATH = "/home/zhihaot/OmniPerception/LidarSensor"
+sys.path.insert(0, LIDAR_PATH)
+# === Lidar 相关 ===
+import warp as wp
+import trimesh
+from LidarSensor.lidar_sensor import LidarSensor
+from LidarSensor.sensor_config.lidar_sensor_config import LidarConfig
+from LidarSensor import RESOURCES_DIR as LS_RESOURCES_DIR
+from isaacgym.torch_utils import quat_apply, quat_mul
+import numpy as np
 # IK func
 def solve_right_arm_ik_jacobian(
     env,
@@ -240,7 +254,8 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     current_time = time.time()
     try:
         for _ in range(30 * int(env.max_episode_length)):
-            flush_start_time1 = time.time()
+
+            t0 = time.perf_counter()
 
             env.gym.refresh_dof_state_tensor(env.sim)
             env.gym.refresh_rigid_body_state_tensor(env.sim)
@@ -362,8 +377,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                     err_norms[:] = float('inf')
 
             env.commands[:, 0] = vx_cmd
-            env.commands[:, 1] = torch.zeros(B, dtype=torch.float32)
             env.commands[:, 2] = yaw_cmd
+            # env.commands[:, 0] = 0
+            # env.commands[:, 2] = 0
+            env.commands[:, 1] = torch.zeros(B, dtype=torch.float32)
             env.commands[:, 4] = height_cmd  # height
 
 
@@ -407,8 +424,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
            
                 epi_buf[i]["eef_to_goal"].append(base_goal_vector)
             # ---- 步进 ----
+            t2 = time.perf_counter()
             obs, reward, _, reset_buf, *_ = env.step(actions.detach())  # reset中也会调用
-
+            t3 = time.perf_counter()
+            # print(" step time:", round((t1 - t0)*1000, 2))
             # break 条件（采够 N episode 或 Ctrl‑C）
             if global_epi >= 5000:
                 break
@@ -460,8 +479,11 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
                 need_reset[reset_ids] = False    # 重置后不再满足“到达”条件   
                 env.gym.clear_lines(viewer)
-                # for i in range(B):
-                #     draw_target_cross(env, viewer, target_pos[i,:])
+                for i in range(B):
+                    draw_target_cross(env, viewer, target_pos[i,:])
+            
+            t1 = time.perf_counter()
+            
 
     finally:
  
@@ -472,5 +494,5 @@ if __name__ == "__main__":
     args = get_args()
     play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.75)
 '''
-python legged_gym/legged_gym/scripts/play_and_record.py --num_envs 1024 --headless
+python legged_gym/legged_gym/scripts/play_and_record.py 
 '''

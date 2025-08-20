@@ -49,6 +49,25 @@ from legged_gym.utils.helpers import class_to_dict
 from .legged_robot_config import LeggedRobotCfg
 import threading
 import time
+import socket, struct, numpy as np
+import time
+
+# --- add LidarSensor to sys.path (manual path) ---
+import sys, os
+LIDAR_PATH = "/home/zhihaot/OmniPerception/LidarSensor"
+sys.path.insert(0, LIDAR_PATH)
+# === Lidar 相关 ===
+import warp as wp
+import trimesh
+from LidarSensor.lidar_sensor import LidarSensor
+from LidarSensor.sensor_config.lidar_sensor_config import LidarConfig
+from LidarSensor import RESOURCES_DIR as LS_RESOURCES_DIR
+from isaacgym.torch_utils import quat_apply, quat_mul
+from LidarSensor.example.isaacgym.utils.terrain.terrain import Terrain
+from LidarSensor.example.isaacgym.utils.terrain.terrain_cfg import Terrain_cfg
+import numpy as np
+from pytorch3d.ops import sample_farthest_points
+from isaacgym import gymutil
 
 def euler_from_quaternion(quat_angle):
     """
@@ -71,6 +90,104 @@ def euler_from_quaternion(quat_angle):
     yaw_z = torch.atan2(t3, t4)
     
     return roll_x.unsqueeze(1), pitch_y.unsqueeze(1), yaw_z.unsqueeze(1)
+class PcBridgeClient:
+    def __init__(self, host='127.0.0.1', port=5555, reconnect_interval=2.0):
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.last_try = 0.0
+        self.reconnect_interval = reconnect_interval
+
+    def _connect(self):
+        now = time.time()
+        if self.sock is not None:
+            return True
+        if now - self.last_try < self.reconnect_interval:
+            return False
+        self.last_try = now
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.connect((self.host, self.port))
+            self.sock = s
+            return True
+        except Exception:
+            self.sock = None
+            return False
+        
+    def send_tf(self, parent_frame: str, child_frame: str,
+                    xyz: np.ndarray, quat_xyzw: np.ndarray):
+            """
+            发送 TF: map->mid_360
+            包格式:
+            <uint32 total_len>
+            <uint8  pkt_type=1>
+            <uint8  parent_len><parent_bytes>
+            <uint8  child_len><child_bytes>
+            <7 * float32>  (x,y,z,qx,qy,qz,qw)
+            """
+            if self.sock is None and not self._connect():
+                return
+            parent_b = parent_frame.encode('utf-8')
+            child_b  = child_frame.encode('utf-8')
+
+            payload = struct.pack(
+                "<B B{}s B{}s 7f".format(len(parent_b), len(child_b)),
+                1,  # pkt_type = 1 表示 TF
+                len(parent_b), parent_b,
+                len(child_b),  child_b,
+                float(xyz[0]), float(xyz[1]), float(xyz[2]),
+                float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2]), float(quat_xyzw[3]),
+            )
+            blob = struct.pack("<I", len(payload)) + payload
+            try:
+                self.sock.sendall(blob)
+            except Exception:
+                try:
+                    if self.sock: self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+
+    def send_points(self, points_xyz: np.ndarray, frame_id: str = "mid_360"):
+        """
+        pkt_type=0 的点云包:
+        <uint32 total_len>
+        <uint8  pkt_type=0>
+        <uint32 N>
+        <uint8  name_len><name_bytes>
+        <N*3*float32>
+        """
+        if points_xyz is None or points_xyz.size == 0:
+            return
+
+        # dtype / 连续性
+        pts = np.asarray(points_xyz, dtype=np.float32, order='C')
+        N = int(pts.shape[0])
+
+        name_bytes = frame_id.encode('utf-8')
+        name_len = len(name_bytes)
+
+        # payload: pkt_type(0) + header + raw points
+        header = struct.pack("<B", 0) + struct.pack("<I", N) + struct.pack("<B", name_len) + name_bytes
+        payload = header + pts.tobytes(order='C')
+
+        # blob: total_len + payload
+        blob = struct.pack("<I", len(payload)) + payload
+
+        # 确保连接
+        if self.sock is None and not self._connect():
+            return
+
+        try:
+            self.sock.sendall(blob)
+        except Exception:
+            try:
+                if self.sock:
+                    self.sock.close()
+            finally:
+                self.sock = None
+
 
 class LeggedRobot(BaseTask):
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
@@ -91,6 +208,17 @@ class LeggedRobot(BaseTask):
         self.height_samples = None
         self.debug_viz = False
         self.init_done = False
+
+        self.sensor_cfg = LidarConfig()
+        self.sensor_cfg.sensor_type ="mid360" # mid360,horizon,HAP,mid70,mid40,tele,avia
+        self.sensor_cfg.max_range = 15.0  # 增加扫描范围到15米
+        self.sim_time = 0
+        self.sensor_update_time = 0
+        self.state_update_time = 0
+        self.sensor_cfg.update_frequency = 50.0
+        self.selected_env_idx = 0 
+        wp.init()
+        self.pc_bridge = PcBridgeClient(host='127.0.0.1', port=5555)
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
         self.num_one_step_obs = self.cfg.env.num_one_step_observations
@@ -107,12 +235,124 @@ class LeggedRobot(BaseTask):
         self._prepare_reward_function()
         self.init_done = True
 
+        self.create_warp_env()
+        self.create_warp_tensor()
+        
+        self.sensor = LidarSensor(self.warp_tensor_dict, None, self.sensor_cfg, 1, self.device)
+        self.lidar_tensor, self.sensor_dist_tensor = self.sensor.update()
+
+    def create_warp_tensor(self):
+        self.warp_tensor_dict={}
+        self.lidar_tensor = torch.zeros(
+                (
+                    self.num_envs,  #4
+                    self.sensor_cfg.num_sensors, #1
+                    self.sensor_cfg.vertical_line_num, #128
+                    self.sensor_cfg.horizontal_line_num, #512
+                    3, #3
+                ),
+                device=self.device,
+                requires_grad=False,
+            )        
+        self.sensor_dist_tensor = torch.zeros(
+                (
+                    self.num_envs,  #4
+                    self.sensor_cfg.num_sensors, #1
+                    self.sensor_cfg.vertical_line_num, #128
+                    self.sensor_cfg.horizontal_line_num, #512
+                ),
+                device=self.device,
+                requires_grad=False,
+            ) 
+        #self.mesh_ids = self.mesh_ids_array = wp.array(self.warp_mesh_id_list, dtype=wp.uint64)
+        self.sensor_pos_tensor = torch.zeros_like(self.root_states[:, 0:3])
+        self.sensor_quat_tensor = torch.zeros_like(self.root_states[:, 3:7])
+        
+        
+        self.sensor_translation = torch.tensor([0., 0.0, 0.436], device=self.device).repeat((self.num_envs, 1))
+        rpy_offset = torch.tensor([3.14, 0, 0], device=self.device)
+
+        self.sensor_offset_quat = quat_from_euler_xyz(rpy_offset[0], rpy_offset[1], rpy_offset[2]).repeat((self.num_envs, 1))
+        # self.sensor_pos_tensor = self.root_states[:, 0:3]
+        # self.sensor_quat_tensor = self.root_states[:, 3:7]
+        
+        self.warp_tensor_dict["sensor_dist_tensor"] = self.sensor_dist_tensor
+        self.warp_tensor_dict['device'] = self.device
+        self.warp_tensor_dict['num_envs'] = self.num_envs
+        self.warp_tensor_dict['num_sensors'] = self.sensor_cfg.num_sensors
+        self.warp_tensor_dict['sensor_pos_tensor'] = self.sensor_pos_tensor
+        self.warp_tensor_dict['sensor_quat_tensor'] = self.sensor_quat_tensor
+        self.warp_tensor_dict['mesh_ids'] = self.mesh_ids
+
+    def create_warp_env(self):
+            
+
+            print("input lidar_triangles",self.lidar_triangles)
+            print("input lidar_vertices",self.lidar_vertices)
+            terrain_mesh = trimesh.Trimesh(vertices=self.lidar_vertices, faces=self.lidar_triangles)
+            #save terrain mesh
+            transform = np.zeros((3,))
+            transform[0] = -self.terrain_cfg.border_size 
+            transform[1] = -self.terrain_cfg.border_size
+            transform[2] = 0.0
+            translation = trimesh.transformations.translation_matrix(transform)
+            terrain_mesh.apply_transform(translation)
+
+            # current_script_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            
+            # two_levels_up = os.path.dirname(os.path.dirname(current_script_dir))
+            
+            
+            # obstacle_mesh_path = os.path.join(two_levels_up, "resources", "robots","g1_29", "robot_combined.stl")
+            
+            # obstacle_mesh = trimesh.load(obstacle_mesh_path)
+
+
+            #     #obstacle_mesh = trimesh.load(self.terrain_cfg.obstacle_config.obstacle_root_path+"/human/meshes/Male.OBJ")
+            # transaltion = np.zeros((3,))
+            # transaltion[0]=self.root_states[0,0]
+            # transaltion[1]=self.root_states[0,1]
+            # transaltion[2]=self.root_states[0,2]
+            # # quat = self.root_states[0,3:7].numpy()
+            # # rotation = trimesh.transformations.quaternion_matrix(quat)
+            # translation = trimesh.transformations.translation_matrix(transaltion)
+                
+            # obstacle_mesh.apply_transform(translation)
+
+            # combine_mesh = trimesh.util.concatenate([terrain_mesh, obstacle_mesh])
+            
+            #save combined mesh
+            #combine_mesh.export("robot_terrain_combined.stl")
+            vertices = terrain_mesh.vertices
+            triangles = terrain_mesh.faces
+            vertex_tensor = torch.tensor( 
+                    vertices,
+                    device=self.device,
+                    requires_grad=False,
+                    dtype=torch.float32,
+                )
+            
+            #if none type in vertex_tensor
+            if vertex_tensor.any() is None:
+                print("vertex_tensor is None")
+            vertex_vec3_array = wp.from_torch(vertex_tensor,dtype=wp.vec3)        
+            faces_wp_int32_array = wp.from_numpy(triangles.flatten(), dtype=wp.int32,device=self.device)
+                    
+            self.wp_meshes =  wp.Mesh(points=vertex_vec3_array,indices=faces_wp_int32_array)
+            
+            self.mesh_ids = self.mesh_ids_array = wp.array([self.wp_meshes.id], dtype=wp.uint64)
+    
+
+
+    
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
 
         Args:
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
+  
         clip_actions = self.cfg.normalization.clip_actions
         if (self.common_step_counter % self.cfg.domain_rand.upper_interval == 0):
             # (NOTE) implementation of upper-body curriculum
@@ -160,14 +400,97 @@ class LeggedRobot(BaseTask):
             self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
 
-        termination_ids, termination_priveleged_obs = self.post_physics_step()
 
+
+        termination_ids, termination_priveleged_obs = self.post_physics_step()
+ 
+        """按 sensor_cfg.update_frequency 做节流更新；可选下采样/可视化"""
+        self.sensor_update_time += self.dt
+        self.base_pose[:] = self.root_states[:, :7]  
+        self.base_quat[:] = self.root_states[:, 3:7]
+        self.sensor_quat_tensor[:] = quat_mul(self.base_quat, self.sensor_offset_quat)
+        self.sensor_pos_tensor[:]  = self.base_pose[:, :3] + quat_apply(self.base_quat, self.sensor_translation)
+        self.lidar_tensor, self.sensor_dist_tensor = self.sensor.update()
+
+        pts = self.lidar_tensor.view(self.num_envs, -1, 3)
+        # print("base", self.base_pose[0, :3])
+        down, _ = sample_farthest_points(pts, K=min(1000, pts.shape[1]))
+
+        self.downsampled_cloud = down.view(self.num_envs, 1, down.shape[1], 3)
+        env_id = getattr(self, "selected_env_idx", 0)  # 选择要发的那个 env
+ 
+        pts_np = self.downsampled_cloud[env_id, 0].detach().contiguous().to('cpu', dtype=torch.float32).numpy()  # (K,3)
+        # if getattr(self, "_pc_send_step", 0) % 3 == 0:
+        self.pc_bridge.send_points(pts_np, frame_id="mid_360")  # frame_id 和 RViz Fixed Frame 对齐
+        # self._pc_send_step = getattr(self, "_pc_send_step", 0) + 1
+
+
+        pos = self.sensor_pos_tensor[env_id].detach().to('cpu').numpy()      # (3,)
+        quat = self.sensor_quat_tensor[env_id].detach().to('cpu').numpy()    # (4,) xyzw
+        self.pc_bridge.send_tf(parent_frame="map", child_frame="mid_360",
+                       xyz=pos, quat_xyzw=quat)
+
+        if self.sensor_update_time + 1e-9 > 1/self.sensor_cfg.update_frequency:
+            self.gym.clear_lines(self.viewer)
+            if self.downsampled_cloud is not None:
+                self._draw_lidar_vis()
+
+            self.sensor_update_time = 0.0
+        self.downsampled_cloud= None
         # return clipped obs, clipped states (None), rewards, dones and infos
         clip_obs = self.cfg.normalization.clip_observations
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
+
+
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras, termination_ids, termination_priveleged_obs
+   
+    def _draw_lidar_vis(self):
+        """ Draws visualizations for dubugging (slows down simulation a lot).
+            Default behaviour: draws height measurement points
+        """
+        # draw height lines
+
+        
+        #self.gym.refresh_rigid_body_state_tensor(self.sim)
+        sphere_geom = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(1, 0, 0))
+
+
+        if self.sensor_cfg.pointcloud_in_world_frame:
+            self.global_pixels =  self.downsampled_cloud
+            for i in range(self.selected_env_idx,self.selected_env_idx+1):
+                for j in range(int(self.global_pixels.shape[2])):
+                    for k in range(self.global_pixels.shape[3]):
+                        x = self.global_pixels[i, 0,j,k,0]#+self.root_states[:1, 0]
+                        y = self.global_pixels[i, 0,j,k,1]
+                        z = self.global_pixels[i, 0,j,k,2]
+                        sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+                        gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+        else:
+            self.local_pixels_downsampled = self.downsampled_cloud.reshape(-1, 3)
+            self.sensor_axis= self.sensor_pos_tensor[:,:]       
+            pixels = self.local_pixels_downsampled.view(self.num_envs,-1,3)
+            pixels_num = pixels.shape[1]
+            sensor_axis_shaped = self.sensor_axis.unsqueeze(1).repeat(1, pixels_num, 1).view(self.num_envs, -1, 3)
+            sensor_quat = self.sensor_quat_tensor.unsqueeze(1).repeat(1, pixels_num, 1).view(self.num_envs, -1, 4)
+            self.global_pixels = sensor_axis_shaped + quat_apply(sensor_quat, pixels)
+            
+            #def draw_line(p1, p2, color, gym, viewer, env):
+            B=self.num_envs
+            self.global_pixels.view(self.num_envs,-1, 3)
+        
+            for i in range(0,B):
+                for j in range(0,self.global_pixels.shape[1]):
+                        x = self.global_pixels[i, j,0]
+                        y = self.global_pixels[i, j,1]
+                        z = self.global_pixels[i, j,2]
+                        sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+                        gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+            
+            
+
+
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -367,9 +690,91 @@ class LeggedRobot(BaseTask):
         """
         self.up_axis_idx = 2 
         self.sim = self.gym.create_sim(self.sim_device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
-        self._create_ground_plane()
-        self._create_envs()
+        # self._create_ground_plane()
+        self._create_ground()
         
+        self._create_envs()
+
+    def _create_ground(self):
+        """Create a ground plane."""
+        self.terrain_cfg = Terrain_cfg()
+        self.terrain = Terrain(self.terrain_cfg, self.num_envs)
+        self._create_trimesh()
+        self._add_static_box_trimesh(center=(4.0, 5.0, 1.0), size=(0.6, 0.6, 10.0))
+
+    def _create_trimesh(self):
+        tm_params = gymapi.TriangleMeshParams()
+        tm_params.nb_vertices = self.terrain.vertices.shape[0]
+        tm_params.nb_triangles = self.terrain.triangles.shape[0]
+        tm_params.transform.p.x = -self.terrain.cfg.border_size 
+        tm_params.transform.p.y = -self.terrain.cfg.border_size
+        tm_params.transform.p.z = 0.0
+        tm_params.static_friction = self.terrain_cfg.static_friction
+        tm_params.dynamic_friction = self.terrain_cfg.dynamic_friction
+        tm_params.restitution = self.terrain_cfg.restitution
+
+        vertices = self.terrain.vertices.astype(np.float32).flatten(order='C')
+        triangles = self.terrain.triangles.astype(np.uint32).flatten(order='C')
+
+        self.gym.add_triangle_mesh(self.sim, vertices, triangles, tm_params)
+
+        # 保存给 LiDAR 用
+        self.lidar_vertices = self.terrain.vertices
+        self.lidar_triangles = self.terrain.triangles
+
+        print("triesh lidar_vertices:", self.lidar_vertices)
+        print("triesh lidar_triangles:", self.lidar_triangles)
+
+    def _add_static_box_trimesh(self, center, size, friction=1.0, restitution=0.0):
+        # center: (cx, cy, cz), size: (sx, sy, sz)
+        cx, cy, cz = center
+        sx, sy, sz = size
+        # 8个顶点
+        vx = sx * 0.5; vy = sy * 0.5; vz = sz * 0.5
+        # 立方体8点
+        V = np.array([
+            [cx-vx, cy-vy, cz-vz],
+            [cx+vx, cy-vy, cz-vz],
+            [cx+vx, cy+vy, cz-vz],
+            [cx-vx, cy+vy, cz-vz],
+            [cx-vx, cy-vy, cz+vz],
+            [cx+vx, cy-vy, cz+vz],
+            [cx+vx, cy+vy, cz+vz],
+            [cx-vx, cy+vy, cz+vz],
+        ], dtype=np.float32)
+
+        # 12个三角面（每面2三角）
+        T = np.array([
+            [0,1,2], [0,2,3],   # bottom
+            [4,5,6], [4,6,7],   # top
+            [0,1,5], [0,5,4],   # -y
+            [1,2,6], [1,6,5],   # +x
+            [2,3,7], [2,7,6],   # +y
+            [3,0,4], [3,4,7],   # -x
+        ], dtype=np.uint32)
+
+        # 提交给模拟器（每个障碍单独一份tm_params即可）
+        tm = gymapi.TriangleMeshParams()
+        tm.nb_vertices   = V.shape[0]
+        tm.nb_triangles  = T.shape[0]
+        tm.transform.p.x = -self.terrain.cfg.border_size
+        tm.transform.p.y = -self.terrain.cfg.border_size
+        tm.transform.p.z = 0.0
+        tm.static_friction = friction
+        tm.dynamic_friction = friction
+        tm.restitution = restitution
+        self.gym.add_triangle_mesh(self.sim, V.flatten(order='C'), T.flatten(order='C'), tm)
+
+
+        base_idx = self.lidar_vertices.shape[0]
+        # 不对box进行坐标变换，因为create_warp_env中会统一处理
+        V_world = V.copy()
+        
+        self.lidar_vertices  = np.vstack([self.lidar_vertices, V_world])
+        self.lidar_triangles = np.vstack([self.lidar_triangles, T + base_idx])
+        print("box lidar_vertices:", self.lidar_vertices)
+        print("box lidar_triangles:", self.lidar_triangles)
+
     def create_cameras(self):
         """ Creates camera for each robot
         """
@@ -733,6 +1138,9 @@ class LeggedRobot(BaseTask):
 
         self.whole_jac = gymtorch.wrap_tensor(self.actor_jacobian) 
 
+        self.base_pose = self.root_states[:, 0:7]
+        self.base_quat = self.root_states[:, 3:7]
+
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
         for i in range(self.num_dof):
@@ -877,7 +1285,7 @@ class LeggedRobot(BaseTask):
             termination_contact_names.extend([s for s in self.body_names if name in s])
             
         self.default_rigid_body_mass = torch.zeros(self.num_bodies, dtype=torch.float, device=self.device, requires_grad=False)
-
+        self.cfg.init_state.pos[2] += 0.02
         base_init_state_list = self.cfg.init_state.pos + self.cfg.init_state.rot + self.cfg.init_state.lin_vel + self.cfg.init_state.ang_vel
         self.base_init_state = to_torch(base_init_state_list, device=self.device, requires_grad=False)
         start_pose = gymapi.Transform()
@@ -908,6 +1316,7 @@ class LeggedRobot(BaseTask):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
             pos = self.env_origins[i].clone()
             pos[:2] += torch_rand_float(-1., 1., (2,1), device=self.device).squeeze(1)
+        
             start_pose.p = gymapi.Vec3(*pos)
                 
             rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, i)

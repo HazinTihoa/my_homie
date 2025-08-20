@@ -176,8 +176,9 @@ def get_args():
     args.task = "g1"
     args.resume = True 
 
+
     # args.num_envs = 1
-    # args.headless = False
+    # args.headless = True
     
     # name allignment
     # args.sim_device_id = args.compute_device_id
@@ -217,3 +218,7 @@ class PolicyExporterHIM(torch.nn.Module):
         self.to('cpu')
         traced_script_module = torch.jit.script(self)
         traced_script_module.save(path)
+
+'''
+python legged_gym/legged_gym/scripts/play_data_collect.py --num_envs 1 --task g1 --resume --rl_device cuda:0 --sim_device cuda:0
+'''
