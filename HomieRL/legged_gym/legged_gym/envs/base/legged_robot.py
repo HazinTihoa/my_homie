@@ -68,6 +68,7 @@ from LidarSensor.example.isaacgym.utils.terrain.terrain_cfg import Terrain_cfg
 import numpy as np
 from pytorch3d.ops import sample_farthest_points
 from isaacgym import gymutil
+from legged_gym.utils.esdf_manager import ESDFManager
 
 def euler_from_quaternion(quat_angle):
     """
@@ -234,12 +235,163 @@ class LeggedRobot(BaseTask):
         self._init_buffers()
         self._prepare_reward_function()
         self.init_done = True
-
         self.create_warp_env()
         self.create_warp_tensor()
+        self.esdf_manager=ESDFManager(self.lidar_vertices,(self.terrain.cfg.border_size ,self.terrain.cfg.border_size))
         
         self.sensor = LidarSensor(self.warp_tensor_dict, None, self.sensor_cfg, 1, self.device)
         self.lidar_tensor, self.sensor_dist_tensor = self.sensor.update()
+
+        # self._visualize_terrain_vertices()
+
+    def visualize_esdf(self):
+        """可视化ESDF，用颜色编码的球体表示距离障碍物的远近"""
+        if not hasattr(self, 'esdf_manager') or self.esdf_manager is None:
+            print("ESDF管理器未初始化")
+            return
+            
+        if not hasattr(self, 'viewer') or self.viewer is None:
+            print("无viewer可用，跳过ESDF可视化")
+            return
+            
+        try:
+            # 获取ESDF数据和格子中心坐标
+            esdf_data = self.esdf_manager.esdf  # shape: (H, W)
+            if esdf_data is None:
+                print("ESDF数据未构建")
+                return
+                
+            X, Y = self.esdf_manager.esdf_grid_centers()  # 格子中心的世界坐标
+            
+            # 下采样策略：限制最大显示点数，避免性能问题
+            max_points = 4000  # 限制最大点数
+            total_points = esdf_data.shape[0] * esdf_data.shape[1]
+
+            downsample_factor = max(1, int(np.sqrt(total_points / max_points)))
+            esdf_sampled = esdf_data[::downsample_factor, ::downsample_factor]
+            X_sampled = X[::downsample_factor, ::downsample_factor]
+            Y_sampled = Y[::downsample_factor, ::downsample_factor]
+            
+            # print(f"ESDF原始尺寸: {esdf_data.shape}, 下采样后: {esdf_sampled.shape}")
+            # print(f"下采样因子: {downsample_factor}")
+            
+            # 扁平化数据以便处理
+            esdf_flat = esdf_sampled.flatten()
+            x_flat = X_sampled.flatten()
+            y_flat = Y_sampled.flatten()
+            
+            # 过滤掉无效值和极端值
+            valid_mask = (~np.isnan(esdf_flat)) & (~np.isinf(esdf_flat)) 
+            esdf_valid = esdf_flat[valid_mask]
+            x_valid = x_flat[valid_mask]
+            y_valid = y_flat[valid_mask]
+            
+            # print(f"有效ESDF点数: {len(esdf_valid)}")
+            
+            if len(esdf_valid) == 0:
+                print("没有有效的ESDF数据点")
+                return
+
+            # 定义高度（地面上方0.1米）
+            z_height = 0.1
+            
+            # 为第一个环境绘制ESDF
+            for i in range(len(esdf_valid)):
+                distance = esdf_valid[i]
+                x = x_valid[i]
+                y = y_valid[i]
+                
+                # ESDF值处理：
+                # 正值 = 距离障碍物的距离（自由空间）
+                # 负值 = 在障碍物内部（用绝对值表示深度）
+                if distance < 0:
+                    # 在障碍物内部，用深红色表示
+                    color = (0.8, 0.0, 0.0)  # 深红色
+                else:
+                    # 自由空间，根据距离用颜色梯度表示
+                    color = self._distance_to_color(distance)
+                
+                # 创建球体几何体，大小根据距离调整
+             
+                sphere_geom = gymutil.WireframeSphereGeometry(
+                    0.1, 6, 6, None, color=color
+                )
+                
+                # 创建球体位置
+                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z_height), r=None)
+                
+                # 绘制球体
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[0], sphere_pose)
+            
+            # print(f"ESDF可视化完成，显示了 {len(esdf_valid)} 个点")
+            # print("深红色=障碍物内部, 红色=危险(近距离), 黄色=中等距离, 绿色=安全(2m+)")
+            
+            # 绘制ESDF地图的四个顶点边界，用蓝色表示
+            self._draw_esdf_corners(z_height)
+            
+        except Exception as e:
+            print(f"ESDF可视化失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _distance_to_color(self, distance):
+        """将距离值转换为颜色（红色=危险，绿色=安全）"""
+        # 距离范围：0-2m
+        # 0m: 红色 (1, 0, 0)
+        # 1m: 黄色 (1, 1, 0) 
+        # 2m+: 绿色 (0, 1, 0)
+        
+        distance = max(0.0, distance)  # 确保距离非负
+        
+        if distance <= 1.0:
+            # 0-1m: 红色到黄色过渡
+            ratio = distance / 1.0
+            return (1.0, ratio, 0.0)  # 红色(1,0,0) -> 黄色(1,1,0)
+        elif distance <= 2.0:
+            # 1-2m: 黄色到绿色过渡
+            ratio = (distance - 1.0) / 1.0
+            return (1.0 - ratio, 1.0, 0.0)  # 黄色(1,1,0) -> 绿色(0,1,0)
+        else:
+            # 2m+: 纯绿色（安全）
+            return (0.0, 1.0, 0.0)
+    
+    def _draw_esdf_corners(self, z_height):
+        """绘制ESDF地图的四个边界顶点，用蓝色表示"""
+        try:
+            # 获取ESDF地图的边界信息
+            origin = self.esdf_manager.origin  # [min_x, min_y]
+            map_width = self.esdf_manager.map_width
+            map_height = self.esdf_manager.map_height
+            resolution = self.esdf_manager.map_resolution
+            
+            # 计算地图边界的世界坐标
+            min_x, min_y = origin[0], origin[1]
+            max_x = min_x + map_width * resolution
+            max_y = min_y + map_height * resolution
+            
+            # 四个边界顶点的坐标
+            corners = [
+                (min_x, min_y, z_height + 0.2),  # 左下角
+                (max_x, min_y, z_height + 0.2),  # 右下角
+                (max_x, max_y, z_height + 0.2),  # 右上角
+                (min_x, max_y, z_height + 0.2),  # 左上角
+            ]
+            
+            # 创建蓝色球体几何体用于标记顶点
+            corner_sphere_geom = gymutil.WireframeSphereGeometry(
+                0.15, 8, 8, None, color=(0.0, 0.0, 1.0)  # 蓝色
+            )
+            
+            # 绘制四个顶点
+            for i, (x, y, z) in enumerate(corners):
+                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+                gymutil.draw_lines(corner_sphere_geom, self.gym, self.viewer, self.envs[0], sphere_pose)
+            
+            print(f"ESDF边界顶点已绘制：({min_x:.2f},{min_y:.2f}) 到 ({max_x:.2f},{max_y:.2f})")
+            print(f"地图尺寸：{map_width}×{map_height} 格子，分辨率：{resolution}m")
+            
+        except Exception as e:
+            print(f"绘制ESDF边界顶点失败: {e}")
 
     def create_warp_tensor(self):
         self.warp_tensor_dict={}
@@ -433,7 +585,10 @@ class LeggedRobot(BaseTask):
         if self.sensor_update_time + 1e-9 > 1/self.sensor_cfg.update_frequency:
             self.gym.clear_lines(self.viewer)
             if self.downsampled_cloud is not None:
-                self._draw_lidar_vis()
+                print("stepping")
+                # self._draw_lidar_vis()
+                self.visualize_esdf()
+            # self._visualize_terrain_vertices()
 
             self.sensor_update_time = 0.0
         self.downsampled_cloud= None
@@ -455,7 +610,6 @@ class LeggedRobot(BaseTask):
         
         #self.gym.refresh_rigid_body_state_tensor(self.sim)
         sphere_geom = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(1, 0, 0))
-
 
         if self.sensor_cfg.pointcloud_in_world_frame:
             self.global_pixels =  self.downsampled_cloud
@@ -489,9 +643,6 @@ class LeggedRobot(BaseTask):
                         gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
             
             
-
-
-
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
             calls self._post_physics_step_callback() for common computations 
@@ -700,7 +851,221 @@ class LeggedRobot(BaseTask):
         self.terrain_cfg = Terrain_cfg()
         self.terrain = Terrain(self.terrain_cfg, self.num_envs)
         self._create_trimesh()
-        self._add_static_box_trimesh(center=(4.0, 5.0, 1.0), size=(0.6, 0.6, 10.0))
+        self._create_random_obstacle()
+        # self._add_static_box_trimesh(center=(4.0, 5.0, 1.0), size=(1.6, 1.6, 10.0), yaw_rad=np.pi/3)
+        # self._add_static_box_trimesh(center=(15.0, 15.0, 1.0), size=(4, 4, 10.0), yaw_rad=np.pi/4)
+
+    def _create_random_obstacles(self):
+        """Create random static obstacles
+            根据地形面积，障碍物密度，随机生成障碍物位置和大小和方向，给定一些参数用来控制障碍物生成
+        """
+        import random
+        
+        # 障碍物生成参数
+        obstacle_density = 0.2  # 障碍物密度：每平方米的障碍物数量
+        min_obstacle_distance = 5.0  # 障碍物之间的最小距离
+        robot_safe_radius = 2.0  # 机器人起始位置的安全半径
+        min_required_distance = 2
+        # 地形参数计算 - 30x30地形的实际尺寸
+        # 配置: terrain_length=10, terrain_width=10, num_rows=2, num_cols=2
+        # 实际地形 = (terrain_length * num_cols) x (terrain_width * num_rows) = 20x20
+        # 加上边界 = (20 + 2*border_size) x (20 + 2*border_size) = 30x30
+        
+        single_terrain_length = self.terrain_cfg.terrain_length  # 10m
+        single_terrain_width = self.terrain_cfg.terrain_width    # 10m
+        num_rows = self.terrain_cfg.num_rows  # 2
+        num_cols = self.terrain_cfg.num_cols  # 2
+        border_size = self.terrain_cfg.border_size  # 5m
+        
+        # 实际地形尺寸（不包括边界）
+        terrain_total_length = single_terrain_length * num_cols  # 20m
+        terrain_total_width = single_terrain_width * num_rows    # 20m
+        
+        # 障碍物生成区域（在地形坐标系中，_add_static_box_trimesh会自动处理border_size平移）
+        min_x = 1.0  # 距离地形边缘1m
+        max_x = terrain_total_length - 1.0  # 19m
+        min_y = 1.0  # 距离地形边缘1m  
+        max_y = terrain_total_width - 1.0   # 19m
+        
+        # 计算需要生成的障碍物数量
+        effective_area = (max_x - min_x) * (max_y - min_y)
+        num_obstacles = int(effective_area * obstacle_density)
+        
+        print(f"=== 随机障碍物生成 ===")
+        print(f"地形配置: {single_terrain_length}×{single_terrain_width}m × {num_rows}×{num_cols} + border({border_size}m)")
+        print(f"实际地形: {terrain_total_length}×{terrain_total_width}m, 生成区域: ({min_x}-{max_x}, {min_y}-{max_y})")
+        print(f"有效面积: {effective_area:.1f}m², 障碍物密度: {obstacle_density}/m², 计划数量: {num_obstacles}")
+        
+        # 障碍物大小范围
+        size_ranges = {
+            'small': (0.3, 0.6),    # 小障碍物
+            'medium': (0.6, 1.2),   # 中等障碍物
+            'large': (1.5, 2.0),    # 大障碍物
+        }
+        
+        # 障碍物高度范围
+        height_range = (0.5, 1.5)
+
+        # 障碍物类型权重（小:中:大 = 2:7:1）
+        obstacle_types = ['small'] * 3 + ['medium'] * 7 + ['large'] * 0
+        
+        # 记录已生成的障碍物位置，用于避免重叠
+        existing_positions = []
+        
+        successful_obstacles = 0
+        max_attempts = num_obstacles * 5  # 最大尝试次数，避免无限循环
+        
+        for _ in range(max_attempts):
+            if successful_obstacles >= num_obstacles:
+                break
+                
+            # 随机选择障碍物类型和尺寸
+            obstacle_type = random.choice(obstacle_types)
+            size_min, size_max = size_ranges[obstacle_type]
+            
+            # 随机生成障碍物参数
+            width = random.uniform(size_min, size_max)
+            length = random.uniform(size_min, size_max)
+            height = random.uniform(*height_range)
+            
+            # 随机生成位置
+            x = random.uniform(min_x + width/2, max_x - width/2)
+            y = random.uniform(min_y + length/2, max_y - length/2)
+            z = height / 2.0  # 障碍物中心高度
+            
+            # 检查与机器人起始位置的距离（假设机器人在原点附近）
+            robot_distance = np.sqrt(x**2 + y**2)
+            if robot_distance < robot_safe_radius:
+                continue
+            
+            # 检查与现有障碍物的距离
+            too_close = False
+            for ex_x, ex_y, ex_w, ex_l in existing_positions:
+                distance = np.sqrt((x - ex_x)**2 + (y - ex_y)**2)
+                # 计算两个障碍物中心之间的最小安全距离
+                current_radius = max(width, length) / 2
+                existing_radius = max(ex_w, ex_l) / 2
+                
+                if distance < min_required_distance:
+                    too_close = True
+                    break
+            
+            if too_close:
+                continue
+            
+            # 随机旋转角度
+            yaw_rad = random.uniform(0, 2 * np.pi)
+            
+            # 生成障碍物
+            self._add_static_box_trimesh(
+                center=(x, y, z), 
+                size=(width, length, height), 
+                yaw_rad=yaw_rad
+            )
+            
+            # 记录位置
+            existing_positions.append((x, y, width, length))
+            successful_obstacles += 1
+            
+            print(f"障碍物 {successful_obstacles}: {obstacle_type} 尺寸={width:.1f}×{length:.1f}×{height:.1f}m, 位置=({x:.1f},{y:.1f}), 角度={np.degrees(yaw_rad):.0f}°")
+        
+        print(f"成功生成 {successful_obstacles} 个随机障碍物 (计划{num_obstacles}个)")
+
+    def _create_random_obstacle(self):
+        """生成更均匀分布的随机障碍物，避开 border"""
+        import random
+        import numpy as np
+
+        # 参数
+        obstacle_density = 0.1       # 每平方米障碍物数量（建议降低一些）
+        robot_safe_radius = 2.0      # 机器人安全区
+        min_required_distance = 2.0  # 最小障碍间距（米）
+
+        # 地形总尺寸（不含 border）
+        terrain_total_length = self.terrain_cfg.terrain_length * self.terrain_cfg.num_cols
+        terrain_total_width  = self.terrain_cfg.terrain_width * self.terrain_cfg.num_rows
+        border_size = self.terrain_cfg.border_size
+
+        # 有效生成区域（避开 border）
+        min_x = border_size
+        max_x = border_size + terrain_total_length
+        min_y = border_size
+        max_y = border_size + terrain_total_width
+
+        # 有效面积
+        effective_area = (max_x - min_x) * (max_y - min_y)
+        num_obstacles = int(effective_area * obstacle_density)
+
+        print(f"=== 随机障碍物生成 ===")
+        print(f"实际可用区域: X=[{min_x},{max_x}], Y=[{min_y},{max_y}]")
+        print(f"有效面积: {effective_area:.1f} m², 计划障碍物数: {num_obstacles}")
+
+        # 障碍物尺寸范围
+        size_ranges = {
+            'small': (0.3, 0.6),
+            'medium': (0.6, 1.2),
+            'large': (1.5, 2.0),
+        }
+        height_range = (0.5, 1.5)
+        obstacle_types = ['small'] * 2 + ['medium'] * 7 + ['large'] * 1
+
+        # === 网格均匀采样 ===
+        grid_rows = int(np.sqrt(num_obstacles))
+        grid_cols = grid_rows
+        cell_w = (max_x - min_x) / grid_cols
+        cell_h = (max_y - min_y) / grid_rows
+
+        successful_obstacles = 0
+        existing_positions = []
+
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                if successful_obstacles >= num_obstacles:
+                    break
+
+                # cell 中心 + 抖动
+                cx = min_x + (c + 0.5) * cell_w + random.uniform(-0.4, 0.4) * cell_w
+                cy = min_y + (r + 0.5) * cell_h + random.uniform(-0.4, 0.4) * cell_h
+
+                # 避开机器人起始位置
+                if np.hypot(cx, cy) < robot_safe_radius:
+                    continue
+
+                # 随机选类型
+                obstacle_type = random.choice(obstacle_types)
+                size_min, size_max = size_ranges[obstacle_type]
+                width = random.uniform(size_min, size_max)
+                length = random.uniform(size_min, size_max)
+                height = random.uniform(*height_range)
+                z = height / 2.0
+
+                # 距离检查
+                too_close = False
+                for ex_x, ex_y, ex_w, ex_l in existing_positions:
+                    if np.hypot(cx - ex_x, cy - ex_y) < min_required_distance:
+                        too_close = True
+                        break
+                if too_close:
+                    continue
+
+                # 随机旋转
+                yaw_rad = random.uniform(0, 2*np.pi)
+
+                # 生成障碍物
+                self._add_static_box_trimesh(
+                    center=(cx, cy, z),
+                    size=(width, length, height),
+                    yaw_rad=yaw_rad
+                )
+
+                existing_positions.append((cx, cy, width, length))
+                successful_obstacles += 1
+                print(f"障碍物 {successful_obstacles}: {obstacle_type}, "
+                    f"尺寸={width:.2f}×{length:.2f}×{height:.2f}, "
+                    f"位置=({cx:.1f},{cy:.1f}), 角度={np.degrees(yaw_rad):.0f}°")
+
+        print(f"成功生成 {successful_obstacles}/{num_obstacles} 个障碍物")
+
 
     def _create_trimesh(self):
         tm_params = gymapi.TriangleMeshParams()
@@ -722,10 +1087,147 @@ class LeggedRobot(BaseTask):
         self.lidar_vertices = self.terrain.vertices
         self.lidar_triangles = self.terrain.triangles
 
-        print("triesh lidar_vertices:", self.lidar_vertices)
-        print("triesh lidar_triangles:", self.lidar_triangles)
+        # # 假设 vertices: (Nv,3) float, triangles: (Nt,3) int
+        # vertices = self.lidar_vertices
+        # triangles = self.lidar_triangles
 
-    def _add_static_box_trimesh(self, center, size, friction=1.0, restitution=0.0):
+        # Nv = vertices.shape[0]
+        # Nt = triangles.shape[0]
+        # print("=== 地形网格密度和分辨率分析 ===")
+        # print(f"顶点数量: {Nv}")
+        # print(f"面片数量: {Nt}")
+
+        # if Nv == 0 or Nt == 0:
+        #     print("网格为空，跳过分析。")
+        #     print("=== 分析完成 ===\n")
+        # else:
+        #     # 包围盒估算（注意这只是 XY 外接矩形面积）
+        #     mins = vertices.min(axis=0)
+        #     maxs = vertices.max(axis=0)
+        #     size = maxs - mins
+        #     area_xy = float(size[0] * size[1])
+
+        #     print(f"地形边界: X=[{mins[0]:.2f}, {maxs[0]:.2f}], "
+        #         f"Y=[{mins[1]:.2f}, {maxs[1]:.2f}], Z=[{mins[2]:.2f}, {maxs[2]:.2f}]")
+        #     print(f"地形尺寸: {size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f} 米")
+        #     print(f"地形XY外接矩形面积(估算): {area_xy:.2f} 平方米")
+
+        #     if area_xy > 0:
+        #         vertex_density = Nv / area_xy
+        #         print(f"顶点密度(基于包围盒): {vertex_density:.2f} 顶点/平方米")
+        #     else:
+        #         print("警告: XY面积为0，无法计算顶点密度。")
+
+        #     # ---- 面片面积（矢量化）----
+        #     # 选取采样索引：全量或随机子集
+        #     max_sample_tri = min(20000, Nt)  # 可调整上限
+        #     if Nt > max_sample_tri:
+        #         idx = np.random.default_rng().choice(Nt, size=max_sample_tri, replace=False)
+        #     else:
+        #         idx = np.arange(Nt)
+
+        #     T = triangles[idx]  # (Ns,3)
+        #     v0 = vertices[T[:,0]]
+        #     v1 = vertices[T[:,1]]
+        #     v2 = vertices[T[:,2]]
+        #     # 面积 = 0.5 * |(v1-v0) x (v2-v0)|
+        #     areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+        #     # 过滤退化
+        #     areas = areas[np.isfinite(areas) & (areas > 1e-12)]
+
+        #     if areas.size > 0:
+        #         print(f"面片面积统计 (采样{areas.size}个面片):")
+        #         print(f"  平均: {areas.mean():.6f}  中位数: {np.median(areas):.6f} "
+        #             f"  [5%,95%]: {np.percentile(areas,5):.6f}, {np.percentile(areas,95):.6f}")
+
+        #         # 如果一定要从面积推边长（近似等边）
+        #         est_edge_from_area = np.sqrt(4.0 * areas.mean() / np.sqrt(3.0))
+        #         print(f"  (等边近似) 面片等效边长: {est_edge_from_area:.4f} m")
+        #     else:
+        #         print("面片面积统计数据不足（可能存在大量退化三角形）。")
+
+        #     # ---- 边长统计（矢量化）----
+        #     max_sample_tri_edges = min(10000, Nt)
+        #     if Nt > max_sample_tri_edges:
+        #         idx_e = np.random.default_rng().choice(Nt, size=max_sample_tri_edges, replace=False)
+        #     else:
+        #         idx_e = np.arange(Nt)
+
+        #     T_e = triangles[idx_e]
+        #     v0 = vertices[T_e[:,0]]
+        #     v1 = vertices[T_e[:,1]]
+        #     v2 = vertices[T_e[:,2]]
+        #     e01 = np.linalg.norm(v1 - v0, axis=1)
+        #     e12 = np.linalg.norm(v2 - v1, axis=1)
+        #     e20 = np.linalg.norm(v0 - v2, axis=1)
+
+        #     edges = np.concatenate([e01, e12, e20])
+        #     edges = edges[np.isfinite(edges) & (edges > 1e-12)]
+
+        #     if edges.size > 0:
+        #         print(f"边长统计 (采样{edges.size}条边):")
+        #         print(f"  平均: {edges.mean():.4f}  中位数: {np.median(edges):.4f} "
+        #             f"  众数近似(5%区间内频次最大bin中心): {np.quantile(edges, 0.5):.4f}")
+        #         print(f"  最小: {edges.min():.4f}  最大: {edges.max():.4f}")
+
+        #         # 建议把“分辨率”报告为边长分布的"中位数/众数"
+        #         est_resolution = float(np.median(edges))
+        #         print(f"  建议报告的地形‘分辨率’(边长中位数): {est_resolution:.4f} m")
+        #     else:
+        #         print("边长统计数据不足。")
+
+        #     print("=== 分析完成 ===\n")
+        
+      
+
+    def _visualize_terrain_vertices(self):
+        """在viewer初始化完成后可视化地形顶点"""
+        print("=== 可视化地形顶点 ===")
+        
+        # 检查是否有viewer可用（在GUI模式下才有viewer）
+        if hasattr(self, 'viewer') and self.viewer is not None:
+            try:
+                # 创建用于可视化的小球几何体 - 用红色表示地形顶点
+                sphere_geom = gymutil.WireframeSphereGeometry(0.05, 32,32, None, color=(1, 0, 0))
+                
+                # 由于顶点太多，需要采样显示，避免可视化过于密集
+                vertices = self.lidar_vertices
+                total_vertices = len(vertices)
+                
+                # 采样策略：使用farthest point sampling，最多显示1000个顶点
+                max_display_vertices = 7000
+                border_size = self.terrain.cfg.border_size
+                
+                if total_vertices > max_display_vertices:
+                    # 使用 farthest point sampling 替代均匀采样
+                    vertices_tensor = torch.tensor(vertices, dtype=torch.float32, device=self.device).unsqueeze(0)
+                    sampled_vertices, _ = sample_farthest_points(vertices_tensor, K=max_display_vertices)
+                    sampled_vertices = sampled_vertices.squeeze(0).cpu().numpy()
+                    print(f"使用farthest point sampling显示 {max_display_vertices} 个顶点 (从总共 {total_vertices} 个中)")
+                else:
+                    sampled_vertices = vertices
+                    print(f"显示全部 {total_vertices} 个顶点")
+                
+                # 为第一个环境绘制采样的地形顶点
+                for vertex in sampled_vertices:
+                    x = float(vertex[0]) - border_size
+                    y = float(vertex[1]) - border_size
+                    z = float(vertex[2])
+                    # 创建球体位置
+                    sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+                    
+                    # 绘制球体
+                    gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[0], sphere_pose)
+                
+                print("地形顶点可视化完成 (红色小球)")
+                
+            except Exception as e:
+                print(f"可视化失败: {e}")
+        else:
+            print("无viewer可用，跳过可视化 (运行在headless模式)")
+        print()
+
+    def _add_static_box_trimesh(self, center, size, yaw_rad=0.0, friction=1.0, restitution=0.0):
         # center: (cx, cy, cz), size: (sx, sy, sz)
         cx, cy, cz = center
         sx, sy, sz = size
@@ -742,6 +1244,16 @@ class LeggedRobot(BaseTask):
             [cx+vx, cy+vy, cz+vz],
             [cx-vx, cy+vy, cz+vz],
         ], dtype=np.float32)
+
+            # 2) 绕Z轴旋转（围绕center）
+        if yaw_rad != 0.0:
+            c, s = np.cos(yaw_rad, dtype=np.float32), np.sin(yaw_rad, dtype=np.float32)
+            Rz = np.array([[c, -s, 0.0],
+                        [s,  c, 0.0],
+                        [0.0,0.0,1.0]], dtype=np.float32)
+            V_rel = V - np.array([[cx, cy, cz]], dtype=np.float32)  # 相对中心
+            V_rot = (V_rel @ Rz.T) + np.array([[cx, cy, cz]], dtype=np.float32)
+            V = V_rot.astype(np.float32)
 
         # 12个三角面（每面2三角）
         T = np.array([
@@ -769,11 +1281,29 @@ class LeggedRobot(BaseTask):
         base_idx = self.lidar_vertices.shape[0]
         # 不对box进行坐标变换，因为create_warp_env中会统一处理
         V_world = V.copy()
-        
-        self.lidar_vertices  = np.vstack([self.lidar_vertices, V_world])
+
+        res = getattr(self,"map_resolution",0.05)
+        edge_pts = self._densify_edges(V_world, step=0.5*res)  # 采样间隔取 0.5*分辨率
+
+        self.lidar_vertices  = np.vstack([self.lidar_vertices, V_world, edge_pts])
         self.lidar_triangles = np.vstack([self.lidar_triangles, T + base_idx])
-        print("box lidar_vertices:", self.lidar_vertices)
-        print("box lidar_triangles:", self.lidar_triangles)
+
+
+    def _densify_edges(self, V, step):
+        """对立方体的 12 条边插值"""
+        edges = [
+            (0,1),(1,2),(2,3),(3,0),   # bottom
+            (4,5),(5,6),(6,7),(7,4),   # top
+            (0,4),(1,5),(2,6),(3,7),   # vertical
+        ]
+        pts = []
+        for i0,i1 in edges:
+            p0, p1 = V[i0], V[i1]
+            L = np.linalg.norm(p1[:2] - p0[:2])   # 只看 XY 平面长度
+            n = max(1, int(np.ceil(L/step)))
+            ts = np.linspace(0, 1, n+1)
+            pts.append((1-ts)[:,None]*p0 + ts[:,None]*p1)
+        return np.vstack(pts).astype(np.float32)
 
     def create_cameras(self):
         """ Creates camera for each robot
