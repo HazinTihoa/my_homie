@@ -212,7 +212,7 @@ class LeggedRobot(BaseTask):
 
         self.sensor_cfg = LidarConfig()
         self.sensor_cfg.sensor_type ="mid360" # mid360,horizon,HAP,mid70,mid40,tele,avia
-        self.sensor_cfg.max_range = 15.0  # 增加扫描范围到15米
+        self.sensor_cfg.max_range = 3.0  # 增加扫描范围到1米
         self.sim_time = 0
         self.sensor_update_time = 0
         self.state_update_time = 0
@@ -264,7 +264,7 @@ class LeggedRobot(BaseTask):
             X, Y = self.esdf_manager.esdf_grid_centers()  # 格子中心的世界坐标
             
             # 下采样策略：限制最大显示点数，避免性能问题
-            max_points = 4000  # 限制最大点数
+            max_points = 10000  # 限制最大点数
             total_points = esdf_data.shape[0] * esdf_data.shape[1]
 
             downsample_factor = max(1, int(np.sqrt(total_points / max_points)))
@@ -293,7 +293,7 @@ class LeggedRobot(BaseTask):
                 return
 
             # 定义高度（地面上方0.1米）
-            z_height = 0.1
+            z_height = 0.05
             
             # 为第一个环境绘制ESDF
             for i in range(len(esdf_valid)):
@@ -314,7 +314,7 @@ class LeggedRobot(BaseTask):
                 # 创建球体几何体，大小根据距离调整
              
                 sphere_geom = gymutil.WireframeSphereGeometry(
-                    0.1, 6, 6, None, color=color
+                    0.05, 6, 6, None, color=color
                 )
                 
                 # 创建球体位置
@@ -327,7 +327,7 @@ class LeggedRobot(BaseTask):
             # print("深红色=障碍物内部, 红色=危险(近距离), 黄色=中等距离, 绿色=安全(2m+)")
             
             # 绘制ESDF地图的四个顶点边界，用蓝色表示
-            self._draw_esdf_corners(z_height)
+            # self._draw_esdf_corners(z_height)
             
         except Exception as e:
             print(f"ESDF可视化失败: {e}")
@@ -565,15 +565,17 @@ class LeggedRobot(BaseTask):
         self.lidar_tensor, self.sensor_dist_tensor = self.sensor.update()
 
         pts = self.lidar_tensor.view(self.num_envs, -1, 3)
+        pts0=pts[0].detach().contiguous().to('cpu', dtype=torch.float32).numpy()
+        # print("lidar points:", pts.shape)
         # print("base", self.base_pose[0, :3])
-        down, _ = sample_farthest_points(pts, K=min(1000, pts.shape[1]))
+        down, _ = sample_farthest_points(pts, K=min(300, pts.shape[1]))
 
         self.downsampled_cloud = down.view(self.num_envs, 1, down.shape[1], 3)
         env_id = getattr(self, "selected_env_idx", 0)  # 选择要发的那个 env
  
         pts_np = self.downsampled_cloud[env_id, 0].detach().contiguous().to('cpu', dtype=torch.float32).numpy()  # (K,3)
         # if getattr(self, "_pc_send_step", 0) % 3 == 0:
-        self.pc_bridge.send_points(pts_np, frame_id="mid_360")  # frame_id 和 RViz Fixed Frame 对齐
+        self.pc_bridge.send_points(pts0, frame_id="mid_360")  # frame_id 和 RViz Fixed Frame 对齐
         # self._pc_send_step = getattr(self, "_pc_send_step", 0) + 1
 
 
@@ -583,11 +585,11 @@ class LeggedRobot(BaseTask):
                        xyz=pos, quat_xyzw=quat)
 
         if self.sensor_update_time + 1e-9 > 1/self.sensor_cfg.update_frequency:
-            self.gym.clear_lines(self.viewer)
+            # self.gym.clear_lines(self.viewer)
             if self.downsampled_cloud is not None:
-                print("stepping")
+                pass
                 # self._draw_lidar_vis()
-                self.visualize_esdf()
+                # self.visualize_esdf()
             # self._visualize_terrain_vertices()
 
             self.sensor_update_time = 0.0
@@ -609,7 +611,7 @@ class LeggedRobot(BaseTask):
 
         
         #self.gym.refresh_rigid_body_state_tensor(self.sim)
-        sphere_geom = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(1, 0, 0))
+        sphere_geom = gymutil.WireframeSphereGeometry(0.05, 12, 12, None, color=(1, 0, 0))
 
         if self.sensor_cfg.pointcloud_in_world_frame:
             self.global_pixels =  self.downsampled_cloud

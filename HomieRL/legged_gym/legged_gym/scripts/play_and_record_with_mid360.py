@@ -25,6 +25,8 @@ from LidarSensor.sensor_config.lidar_sensor_config import LidarConfig
 from LidarSensor import RESOURCES_DIR as LS_RESOURCES_DIR
 from isaacgym.torch_utils import quat_apply, quat_mul
 import numpy as np
+from legged_gym.utils.PathLibNavigator import PathLibNavigator, NavigatorCfg
+PATHS_PLY = "/home/zhihaot/my_homie/HomieRL/legged_gym/legged_gym/utils/path/paths.ply"
 # IK func
 def solve_right_arm_ik_jacobian(
     env,
@@ -73,30 +75,33 @@ def solve_right_arm_ik_jacobian(
     q_new = q_init.cpu() + dq.cpu().numpy() * 0.2  # numpy (7,)
     return q_new, err_norm
 
-def draw_target_cross(env, viewer, target_pos):
+def draw_target_cross(env, viewer, target_pos, sphere_radius=0.2, sphere_color=(1.0, 1.0, 0.0), 
+                      segments=8, rings=8):
+    """
+    在目标位置绘制球体标记
+    
+    Args:
+        env: 环境对象
+        viewer: 查看器对象
+        target_pos: 目标位置 [x, y, z]
+        sphere_radius: 球体半径 (默认0.08m)
+        sphere_color: 球体颜色 RGB (默认红色)
+        segments: 球体经线段数 (默认8)
+        rings: 球体纬线环数 (默认8)
+    """
     tx, ty, tz = float(target_pos[0]), float(target_pos[1]), float(target_pos[2])
-    pts = np.array(
-        [
-            [tx - 0.1, ty, tz],
-            [tx + 0.1, ty, tz],
-            [tx, ty - 0.1, tz],
-            [tx, ty + 0.1, tz],
-        ],
-        dtype=np.float32,
+    
+    # 创建球体几何体
+    sphere_geom = gymutil.WireframeSphereGeometry(
+        sphere_radius, segments, rings, None, color=sphere_color
     )
-    cols = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    count = 2
+    
+    # 创建球体位置
+    sphere_pose = gymapi.Transform(gymapi.Vec3(tx, ty, tz), r=None)
+    
+    # 为每个环境绘制球体
     for env_handle in env.envs:
-        env.gym.add_lines(viewer, env_handle, count, pts, cols)
-
+        gymutil.draw_lines(sphere_geom, env.gym, viewer, env_handle, sphere_pose)
 
 def _save_episode(buffer: dict, epi_id: int, out_dir: str):
     fname = os.path.join(out_dir, f"episode_{epi_id}.hdf5")
@@ -117,6 +122,56 @@ def world2base(vec_world, base_yaw):
     vec_z = vec_world[2]
     vec_base = np.array([vec_xy[0], vec_xy[1], vec_z])  # 合成3维向量
     return vec_base
+
+def make_esdf_query_fn(manager, device):
+    H, W = manager.esdf.shape          # 网格高(H, 对应 y)/宽(W, 对应 x)
+    res = manager.map_resolution       # 分辨率(米/格)
+    ox, oy = manager.origin            # 左下角原点(世界坐标)
+    def query(pts_bm3: torch.Tensor) -> torch.Tensor:
+        x = pts_bm3[..., 0].detach().cpu().numpy()
+        y = pts_bm3[..., 1].detach().cpu().numpy()
+        # 世界坐标 → 栅格索引 (最近邻)
+        i = np.floor((x - ox) / res).astype(np.int32)  # 列索引，对应 x
+        j = np.floor((y - oy) / res).astype(np.int32)  # 行索引，对应 y
+        # 出界裁剪到边界（等同 grid_sample 的 'border'）
+        i = np.clip(i, 0, W - 1); j = np.clip(j, 0, H - 1)
+        d = manager.esdf[j, i]                         # 查距离（正/负）
+        # 回到原来的设备/精度
+        return torch.from_numpy(d).to(pts_bm3.device, dtype=pts_bm3.dtype)
+    return query
+
+def make_esdf_query_fn_torch(manager, device):
+    esdf = torch.from_numpy(manager.esdf).to(device)   # [H, W]
+    H, W = esdf.shape
+    res = manager.map_resolution
+    ox, oy = map(float, manager.origin)
+
+    def query(pts_bm3: torch.Tensor) -> torch.Tensor:
+        # 连续栅格坐标（以像素左上角为 0）
+        x = (pts_bm3[..., 0] - ox) / res
+        y = (pts_bm3[..., 1] - oy) / res
+
+        i0 = torch.floor(x).long().clamp_(0, W - 1)
+        j0 = torch.floor(y).long().clamp_(0, H - 1)
+        i1 = (i0 + 1).clamp_(0, W - 1)
+        j1 = (j0 + 1).clamp_(0, H - 1)
+
+        wx = (x - i0.float()).clamp_(0, 1)
+        wy = (y - j0.float()).clamp_(0, 1)
+
+        # 取四邻域
+        d00 = esdf[j0, i0]
+        d10 = esdf[j0, i1]
+        d01 = esdf[j1, i0]
+        d11 = esdf[j1, i1]
+
+        # x 方向线性，再 y 方向线性
+        d0 = d00 * (1 - wx) + d10 * wx
+        d1 = d01 * (1 - wx) + d11 * wx
+        d  = d0 * (1 - wy) + d1 * wy
+
+        return d.to(dtype=pts_bm3.dtype)
+    return query
 
 def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
@@ -184,18 +239,15 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     rb_shoulder_index = rb_names.index("right_shoulder_pitch_link")
     rb_wrist_index = rb_names.index("right_wrist_yaw_link")
 
-
-
     device = env.device
     env.reset_idx(torch.arange(env.num_envs).to("cuda:0"))
     # cpu_inds = torch.arange(env.num_envs, dtype=torch.int32)
     # env.reset_idx(cpu_inds)
 
-
-    arrive_tollerance = 0.2  # pos tollerance
+    arrive_tollerance = 0.5  # pos tollerance
     heading_thresh = 0.16  # yaw 30 degree tollerance
     max_speed = 1  # max linear speed
-    arm_end_target_err = 0.1
+    arm_end_target_err = 0.3
 
     viewer = env.viewer
     env.gym.clear_lines(viewer)
@@ -207,13 +259,13 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # pos_xyz     = root[:, 0:3].clone()      # (B, 3)  所有机器人的 (x,y,z)
     pos_xyz = root[:, 0:3].clone().to(device)
 
-    tar_range=6
+    tar_range=10
     hei_coe= 1.0
     hei_bias= 0.3
     # 生成目标位置
     target_pos[:, :2] = torch.rand(B, 2) * tar_range -tar_range/2# x,y
-    target_pos[:, 0] += pos_xyz[:, 0] # x
-    target_pos[:, 1] += pos_xyz[:, 1]# y
+    target_pos[:, 0] += pos_xyz[:, 0]+5# x
+    target_pos[:, 1] += pos_xyz[:, 1]+5# y
     target_pos[:, 2] = torch.rand(B)*hei_coe + hei_bias  # height
 
     arm_joint_indices = torch.arange(26, 33, dtype=torch.long, device=env.device)
@@ -223,11 +275,9 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     for i in range(B):
         draw_target_cross(env, viewer, target_pos[i,:])
 
-    
     _dof  = env.gym.acquire_dof_state_tensor(env.sim)
     _rb   = env.gym.acquire_rigid_body_state_tensor(env.sim)
     _jac  = env.gym.acquire_jacobian_tensor(env.sim, env.cfg.asset.name)
-
 
    # -------- 2. 打开 HDF5 文件 --------
     out_dir = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "act_dataset")
@@ -244,19 +294,26 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     rb_names = env.gym.get_actor_rigid_body_names(env.envs[0], env.actor_handles[0])
     wrist_idx = rb_names.index("right_wrist_yaw_link")
 
-
     obs = env.get_observations()
     env.reset_idx(torch.arange(B, device=device))
 
     # acquire tensors once
     _rb = env.gym.acquire_rigid_body_state_tensor(env.sim)
-     # -------- 2. 打开 HDF5 文件 --------
-    current_time = time.time()
+
+    nav_cfg = NavigatorCfg(
+        resample_N=60,
+        rot_deg=tuple(range(-90, 90, 15)),   # 先用 18 个角度，算力轻
+        scales=(1.0,),                       # 先只用 1 个尺度
+        lookahead=0.5, v_max=1.0, w_gain=3.0, w_max=1.0,
+        rs_chunk=8, k_chunk=128
+    )
+    navigator = PathLibNavigator(PATHS_PLY, device=env.device, cfg=nav_cfg)
+    # esdf_query_fn=make_esdf_query_fn(manager=env.esdf_manager, device=env.device)
+    esdf_query_fn=make_esdf_query_fn_torch(manager=env.esdf_manager, device=env.device)
+    # env.visualize_esdf()
     try:
         for _ in range(30 * int(env.max_episode_length)):
-
-            t0 = time.perf_counter()
-
+            t0=time.perf_counter()
             env.gym.refresh_dof_state_tensor(env.sim)
             env.gym.refresh_rigid_body_state_tensor(env.sim)
             env.gym.refresh_jacobian_tensors(env.sim)
@@ -265,23 +322,17 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             rb_tensor  = gymtorch.wrap_tensor(_rb ).view(B, -1, 13)      # (B, L, 13)
             jacobian   = gymtorch.wrap_tensor(_jac).view(B, env.num_bodies, 6, -1)  # (B, L, 6, D)
 
-
-
-
             current_pos_xy = env.root_states[:, :2]  # 只取 x,y
             qx, qy, qz, qw = env.root_states[:, 3:7].unbind(dim=1)  # 快速拆 4 列，各 (B,)
             # cal_yaw
             siny_cosp = 2 * (qw * qz + qx * qy)
             cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
             yaw_currrent = torch.atan2(siny_cosp, cosy_cosp)
-
             target_pos_xy = target_pos[:, :2]  # 只取 x,y
             dx = target_pos_xy[:, 0].to(device) - current_pos_xy[:, 0].to(device)
             dy = target_pos_xy[:, 1].to(device) - current_pos_xy[:, 1].to(device)
-            
             pos_z     = env.root_states[:, 2]      # (B, 1)所有机器人的 (z)
             eps          = 5e-2
-            
 
             yaw_target = torch.atan2(dy, dx)
             dtheta = torch.atan2(torch.sin(yaw_target - yaw_currrent), torch.cos(yaw_target - yaw_currrent))
@@ -299,21 +350,14 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             no_need_approach = dist <= arrive_tollerance+0.1
 
             yaw_cmd  = torch.where(need_turn, yaw, torch.zeros_like(yaw))
-
             vx_cmd  = torch.where(need_approach, vx_nominal,torch.zeros_like(vx_nominal))
             height_cmd  = torch.where(no_need_turn&no_need_approach,  height_tar, pos_z)
             
-
             no_need_height =torch.abs(pos_z - height_cmd) < eps
-
             need_arm_ik=torch.where(no_need_turn&no_need_approach&no_need_height,True,False) 
-
             ik_cal_idx  = torch.nonzero(need_arm_ik).squeeze(1)  # (k,)
 
-
-            
-            flag=True
-            if flag:
+            if True:
                 if ik_cal_idx.numel():
                     n= ik_cal_idx.numel()
                     for env_idx in ik_cal_idx:
@@ -362,7 +406,6 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                     JJT       = torch.matmul(J, J.transpose(-1, -2))             # (k, 6, 6)
                     reg_eye   = torch.eye(6, device=device).expand(k, 6, 6) * lambda_sq
                     inv_term  = torch.linalg.inv(JJT + reg_eye)                  # (k, 6, 6)
-
                     dpose6    = torch.zeros(k, 6, 1, device=device)
                     dpose6[:, 0:3, 0] = pos_err                                  # 位置误差
                     dq        = torch.matmul(J.transpose(-1, -2),
@@ -376,13 +419,37 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 else:
                     err_norms[:] = float('inf')
 
-            env.commands[:, 0] = vx_cmd
-            env.commands[:, 2] = yaw_cmd
+
+            # collision_free_nav
+            if True:
+                current_pos_xy = env.root_states[:, :2]
+                qx, qy, qz, qw = env.root_states[:, 3:7].unbind(-1)
+                siny_cosp = 2 * (qw * qz + qx * qy)
+                cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+                yaw_current = torch.atan2(siny_cosp, cosy_cosp)
+                
+                # 选轨并跟踪 -> 得到 (vx, wz)
+                t0 = time.perf_counter()
+   
+                nav_out = navigator.select_and_track(
+                    base_pos_xy=current_pos_xy,
+                    base_yaw=yaw_current,
+                    target_pos_xy=target_pos[:, :2],
+                    esdf_query_fn=esdf_query_fn
+                )
+                t1 = time.perf_counter()
+                # print(f"nav time: {(t1-t0)*1000:.2f} ms")
+
+                env.commands[:, 0] = nav_out['vx']      # vx
+                env.commands[:, 2] = nav_out['wz']      # wz
+            #previous cmd
+            # env.commands[:, 0] = vx_cmd
+            # env.commands[:, 2] = yaw_cmd
             # env.commands[:, 0] = 0
             # env.commands[:, 2] = 0
+
             env.commands[:, 1] = torch.zeros(B, dtype=torch.float32)
             env.commands[:, 4] = height_cmd  # height
-
 
             actions = policy(obs.detach())
             left_arm_joint = left_arm_joint.view(B, -1)
@@ -392,7 +459,6 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             actions = torch.cat([actions, waist_yaw_joint, left_arm_joint, right_arm_joint], dim=1)
             upper_actions = torch.cat([waist_yaw_joint, left_arm_joint, right_arm_joint], dim=1)
 
-            # ---- 2.2 收集数据到缓冲区 ----
             env.gym.refresh_rigid_body_state_tensor(env.sim)
             rb_tensor = gymtorch.wrap_tensor(_rb).view(B, -1, 13)
             s_vx = env.root_states[:, 7]  # (B,)
@@ -417,79 +483,62 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 epi_buf[i]["obs_vel_and_height"].append(obs_vec)
                 wrist_pos = rb_tensor[i, wrist_idx, 0:3].cpu().numpy()
                 goal_pos = target_pos[i].cpu().numpy()
-
                 world_goal_vector=goal_pos - wrist_pos
-                
                 base_goal_vector=world2base(world_goal_vector,yaw_currrent[i].item())
-           
                 epi_buf[i]["eef_to_goal"].append(base_goal_vector)
-            # ---- 步进 ----
-            t2 = time.perf_counter()
+
             obs, reward, _, reset_buf, *_ = env.step(actions.detach())  # reset中也会调用
-            t3 = time.perf_counter()
-            # print(" step time:", round((t1 - t0)*1000, 2))
-            # break 条件（采够 N episode 或 Ctrl‑C）
+
             if global_epi >= 5000:
                 break
-            
-            # print("right_arm_joint:", right_arm_joint[0,:])
             reset_ids  = torch.nonzero(need_reset).squeeze(1)
             reset_buf = torch.nonzero(reset_buf).squeeze(1)
             
             if reset_buf.numel()>0:
                 # env.reset_idx(reset_buf.cuda())        # 物理重置
-
                 n= reset_buf.numel()
                 right_arm_joint[reset_buf,:] = torch.zeros(7, dtype=torch.float32,device=device)
                 height_cmd[reset_buf]     = 0.75
                 target_pos[reset_buf, 2] = torch.rand(n, device=device)*hei_coe + hei_bias  # height
                 target_pos[reset_buf, :2] = torch.rand(n, 2, device=device) * tar_range - tar_range/2# x,y
-                target_pos[reset_buf, 0] += pos_xyz[reset_buf, 0]  # x
-                target_pos[reset_buf, 1] += pos_xyz[reset_buf, 1]  # y
-
-
+                target_pos[reset_buf, 0] += pos_xyz[reset_buf, 0] +5 # x
+                target_pos[reset_buf, 1] += pos_xyz[reset_buf, 1] +5# y
                 env.gym.clear_lines(viewer)
                 for i in range(B):
                     draw_target_cross(env, viewer, target_pos[i,:])
 
             if reset_ids.numel():
-                # 1) 写盘 + 清空缓冲
                 for idx in reset_ids.cpu().tolist():
                     if 0 < len(epi_buf[idx]['upper_actions']) <=1000:               # 防止空 episode
                         flush_start_time = time.time()
                         _save_episode(epi_buf[idx], global_epi, out_dir)                
                         consume_time = time.time()-flush_start_time
-                
                         print(f"[ACT‑dataset] wrote episode {global_epi} with {len(epi_buf[idx]['upper_actions'])} steps,time cost: {consume_time:.6f} seconds")
                         global_epi += 1
                         for key in epi_buf[idx]:
                             epi_buf[idx][key] = []  
                         epi_buf[idx] = dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[],qvel=[],obs_vel_and_height=[])
 
-
                 env.reset_idx(reset_ids.cuda())        # 物理重置
-
                 n= reset_ids.numel()
                 right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32,device=device)
                 height_cmd[reset_ids]     = 0.75
                 target_pos[reset_ids, 2] = torch.rand(n, device=device)*hei_coe + hei_bias  # height
                 target_pos[reset_ids, :2] = torch.rand(n, 2, device=device) * tar_range - tar_range/2 # x,y
-                target_pos[reset_ids, 0] += pos_xyz[reset_ids, 0]  # x
-                target_pos[reset_ids, 1] += pos_xyz[reset_ids, 1]  # y
-
+                target_pos[reset_ids, 0] += pos_xyz[reset_ids, 0] +5# x
+                target_pos[reset_ids, 1] += pos_xyz[reset_ids, 1] +5# y
                 need_reset[reset_ids] = False    # 重置后不再满足“到达”条件   
                 env.gym.clear_lines(viewer)
                 for i in range(B):
+                    
                     draw_target_cross(env, viewer, target_pos[i,:])
-            
-            t1 = time.perf_counter()
-            
-
+                    
+            t1=time.perf_counter()
+            # print(f"per frame time: {(t1-t0)*1000:.2f} ms")
     finally:
  
         print(f"=========================")
 
-    
 if __name__ == "__main__":
     args = get_args()
     play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.75)
