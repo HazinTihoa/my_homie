@@ -75,7 +75,7 @@ def solve_right_arm_ik_jacobian(
     q_new = q_init.cpu() + dq.cpu().numpy() * 0.2  # numpy (7,)
     return q_new, err_norm
 
-def draw_target_cross(env, viewer, target_pos, sphere_radius=0.2, sphere_color=(1.0, 1.0, 0.0), 
+def draw_target_cross(env, viewer, target_pos, sphere_radius=0.08, sphere_color=(1.0, 1.0, 0.0), 
                       segments=8, rings=8):
     """
     在目标位置绘制球体标记
@@ -173,6 +173,186 @@ def make_esdf_query_fn_torch(manager, device):
         return d.to(dtype=pts_bm3.dtype)
     return query
 
+def make_esdf_projector(manager, device, safe_clearance=0.2, step_gain=0.9, max_iters=30,z_range=None):
+    """
+    基于 ESDF 的目标点安全投影器：
+    - 给定任意世界坐标点（B,3），沿 ESDF 梯度上升把点推到 clearance >= safe_clearance
+    - 只移动 x,y；z 保持/可选夹紧
+    参数:
+        manager: 含 esdf(np.ndarray[H,W])、map_resolution(float)、origin(tuple[x0,y0]) 的对象
+        device:  torch.device
+        safe_clearance: 期望最小安全距离（米）
+        step_gain: 每步的“目标增量比例”，取 (0,1]，越大收敛越快，但可能振荡
+        max_iters: 迭代次数上限
+    返回:
+        projector(points_b3, z_range=None) -> (safe_points_b3, final_clearance_b)
+    """
+    esdf = torch.from_numpy(manager.esdf).to(device)  # [H, W]
+    H, W = esdf.shape
+    res = float(manager.map_resolution)
+    ox, oy = map(float, manager.origin)
+
+    # 世界->像素坐标（浮点）
+    def world_to_pix(x, y):
+        px = (x - ox) / res
+        py = (y - oy) / res
+        return px, py
+
+    # 双线性采样 ESDF 值 & 像素坐标梯度（∂d/∂px, ∂d/∂py）
+    def bilinear_value_and_pixgrad(px, py):
+        # 邻域索引
+        i0 = torch.floor(px).long().clamp_(0, W - 1)
+        j0 = torch.floor(py).long().clamp_(0, H - 1)
+        i1 = (i0 + 1).clamp_(0, W - 1)
+        j1 = (j0 + 1).clamp_(0, H - 1)
+
+        # 权重
+        wx = (px - i0.float()).clamp_(0, 1)
+        wy = (py - j0.float()).clamp_(0, 1)
+
+        # 四邻域值
+        d00 = esdf[j0, i0]
+        d10 = esdf[j0, i1]
+        d01 = esdf[j1, i0]
+        d11 = esdf[j1, i1]
+
+        # 双线性插值值
+        d0 = d00 * (1 - wx) + d10 * wx
+        d1 = d01 * (1 - wx) + d11 * wx
+        d  = d0  * (1 - wy) + d1  * wy
+
+        # 双线性函数的像素梯度（注意是对 px/py 的偏导）
+        # ∂d/∂px = (1-wy)*(d10-d00) + wy*(d11-d01)
+        # ∂d/∂py = (1-wx)*(d01-d00) + wx*(d11-d10)
+        dd_dpx = (1 - wy) * (d10 - d00) + wy * (d11 - d01)
+        dd_dpy = (1 - wx) * (d01 - d00) + wx * (d11 - d10)
+
+        return d, dd_dpx, dd_dpy
+
+    # 像素梯度 -> 世界坐标梯度（米^-1）
+    # px = (x-ox)/res → ∂/∂x = (1/res)*∂/∂px
+    def to_world_grad(dd_dpx, dd_dpy):
+        inv_res = 1.0 / res
+        gx = dd_dpx * inv_res
+        gy = dd_dpy * inv_res
+        return gx, gy
+
+    # 将世界坐标裁剪到地图边界（避免越界）
+    def clamp_to_map(x, y, margin_pix=1.0):
+        # 允许留一点像素余量，默认 1 像素
+        x_min = ox + margin_pix * res
+        y_min = oy + margin_pix * res
+        x_max = ox + (W - 1 - margin_pix) * res
+        y_max = oy + (H - 1 - margin_pix) * res
+        return x.clamp(x_min, x_max), y.clamp(y_min, y_max)
+
+    def projector(points_b3: torch.Tensor, z_range=None):
+        """
+        参数:
+            points_b3: [B,3] 世界坐标
+            z_range: Optional[min_z, max_z]，若给定则把 z 夹紧到范围
+        返回:
+            safe_points_b3: [B,3]
+            final_clearance_b: [B]
+        """
+        assert points_b3.dim() == 2 and points_b3.size(-1) == 3
+        pts = points_b3.clone().to(device)
+
+        if z_range is not None:
+            z_min, z_max = float(z_range[0]), float(z_range[1])
+            pts[:, 2] = pts[:, 2].clamp(z_min, z_max)
+
+        for _ in range(max_iters):
+            px, py = world_to_pix(pts[:, 0], pts[:, 1])
+            d, dd_dpx, dd_dpy = bilinear_value_and_pixgrad(px, py)
+            gx, gy = to_world_grad(dd_dpx, dd_dpy)  # 世界坐标梯度
+
+            need = d < safe_clearance
+            if not need.any():
+                break  # 全部满足
+
+            # 梯度方向（上升）
+            g = torch.stack([gx, gy], dim=-1)  # [B,2]
+            g_norm = torch.linalg.norm(g, dim=-1, keepdim=True).clamp_min(1e-8)
+
+            # 对于需要移动的点，计算位移步长（按缺口比例）
+            # 目标：本步大约提升 clearance 到 safe_clearance 的 step_gain 比例
+            step = (safe_clearance - d).clamp_min(0.0) * step_gain  # [B]
+            delta = (step.view(-1, 1) / g_norm) * g                 # [B,2]
+
+            # 梯度过小（平坦区）时，给一个微小随机抖动方向以脱离平台
+            flat = (g_norm.squeeze(-1) < 1e-6) & need
+            if flat.any():
+                jitter = torch.randn(flat.sum(), 2, device=device)
+                jitter = jitter / torch.linalg.norm(jitter, dim=-1, keepdim=True).clamp_min(1e-6)
+                delta[flat] = 0.05 * jitter  # 5cm 小抖动
+
+            # 只更新不合格的点
+            pts[:, 0] = torch.where(need, pts[:, 0] + delta[:, 0], pts[:, 0])
+            pts[:, 1] = torch.where(need, pts[:, 1] + delta[:, 1], pts[:, 1])
+
+            # 防越界裁剪
+            pts[:, 0], pts[:, 1] = clamp_to_map(pts[:, 0], pts[:, 1])
+
+            # 可选：若提供 z_range，继续夹紧 z
+            if z_range is not None:
+                pts[:, 2] = pts[:, 2].clamp(z_min, z_max)
+
+        # 返回最终 clearance
+        px, py = world_to_pix(pts[:, 0], pts[:, 1])
+        d_final, _, _ = bilinear_value_and_pixgrad(px, py)
+        return pts, d_final
+
+    return projector
+
+def Target_generate(pos_xyz, tar_range, z_range=(0.3, 1.3), manager=None, device=None, reset_indices=None):
+    """
+    生成目标点位置
+
+    参数:
+        pos_xyz: [B, 3]，起始位置
+        tar_range: float，目标点xy的采样范围
+        z_range: tuple (min_hei, max_hei)，高度范围
+        manager: ESDF管理器，用于安全投影
+        device: torch设备
+        reset_indices: 需要重置的索引，如果为None则生成所有环境的目标点
+
+    返回:
+        target_pos: [B, 3]，目标点位置
+    """
+    B = pos_xyz.shape[0]
+    min_hei, max_hei = z_range
+
+    if reset_indices is not None:
+        # 只为指定的环境生成新目标点
+        n = reset_indices.numel()
+        new_targets = torch.zeros(n, 3, device=device)
+        new_targets[:, :2] = torch.rand(n, 2, device=device) * tar_range - tar_range / 2  # x, y
+        new_targets[:, 0] += pos_xyz[reset_indices, 0]  # x
+        new_targets[:, 1] += pos_xyz[reset_indices, 1]  # y
+        new_targets[:, 2] = torch.rand(n, device=device) * (max_hei - min_hei) + min_hei  # height
+
+        if manager is not None:
+            projector = make_esdf_projector(manager, device, z_range=z_range)
+            safe_targets, _ = projector(new_targets, z_range=z_range)
+            return safe_targets
+        else:
+            return new_targets
+    else:
+        # 为所有环境生成目标点
+        target_pos = torch.zeros(B, 3, device=device)
+        target_pos[:, :2] = torch.rand(B, 2, device=device) * tar_range - tar_range / 2  # x, y
+        target_pos[:, 0] += pos_xyz[:, 0]  # x
+        target_pos[:, 1] += pos_xyz[:, 1]  # y
+        target_pos[:, 2] = torch.rand(B, device=device) * (max_hei - min_hei) + min_hei  # height
+
+        projector = make_esdf_projector(manager, device, z_range=z_range)
+        safe_points, _ = projector(target_pos, z_range=z_range)
+        return safe_points
+
+     
+
+    
 def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
@@ -259,21 +439,22 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # pos_xyz     = root[:, 0:3].clone()      # (B, 3)  所有机器人的 (x,y,z)
     pos_xyz = root[:, 0:3].clone().to(device)
 
-    tar_range=10
-    hei_coe= 1.0
+    tar_range=3
+    hei_coe= 0.2
     hei_bias= 0.3
     # 生成目标位置
     target_pos[:, :2] = torch.rand(B, 2) * tar_range -tar_range/2# x,y
-    target_pos[:, 0] += pos_xyz[:, 0]+5# x
-    target_pos[:, 1] += pos_xyz[:, 1]+5# y
+    target_pos[:, 0] += pos_xyz[:, 0]# x
+    target_pos[:, 1] += pos_xyz[:, 1]# y
     target_pos[:, 2] = torch.rand(B)*hei_coe + hei_bias  # height
-
+    safe_target_pos = Target_generate(pos_xyz,tar_range=3,z_range=(0.3,1.3),manager=env.esdf_manager,device=env.device)
     arm_joint_indices = torch.arange(26, 33, dtype=torch.long, device=env.device)
     # Draw a cross at each target position for every environment
     err_norms = torch.zeros(B, device=env.device, dtype=torch.float32)
     need_reset = torch.zeros(B, device=env.device, dtype=torch.bool)
     for i in range(B):
-        draw_target_cross(env, viewer, target_pos[i,:])
+        # draw_target_cross(env, viewer, target_pos[i,:])
+        draw_target_cross(env, viewer, safe_target_pos[i,:])
 
     _dof  = env.gym.acquire_dof_state_tensor(env.sim)
     _rb   = env.gym.acquire_rigid_body_state_tensor(env.sim)
@@ -313,11 +494,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # env.visualize_esdf()
     try:
         for _ in range(30 * int(env.max_episode_length)):
-            t0=time.perf_counter()
             env.gym.refresh_dof_state_tensor(env.sim)
             env.gym.refresh_rigid_body_state_tensor(env.sim)
             env.gym.refresh_jacobian_tensors(env.sim)
-            t_sim0 = env.gym.get_sim_time(env.sim)
+
             dof_tensor = gymtorch.wrap_tensor(_dof).view(B, -1, 2)         # (B, D, 2)
             rb_tensor  = gymtorch.wrap_tensor(_rb ).view(B, -1, 13)      # (B, L, 13)
             jacobian   = gymtorch.wrap_tensor(_jac).view(B, env.num_bodies, 6, -1)  # (B, L, 6, D)
@@ -357,7 +537,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             need_arm_ik=torch.where(no_need_turn&no_need_approach&no_need_height,True,False) 
             ik_cal_idx  = torch.nonzero(need_arm_ik).squeeze(1)  # (k,)
 
-            if True:
+            if False:
                 if ik_cal_idx.numel():
                     n= ik_cal_idx.numel()
                     for env_idx in ik_cal_idx:
@@ -442,6 +622,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
                 env.commands[:, 0] = nav_out['vx']      # vx
                 env.commands[:, 2] = nav_out['wz']      # wz
+
             #previous cmd
             # env.commands[:, 0] = vx_cmd
             # env.commands[:, 2] = yaw_cmd
@@ -486,8 +667,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 world_goal_vector=goal_pos - wrist_pos
                 base_goal_vector=world2base(world_goal_vector,yaw_currrent[i].item())
                 epi_buf[i]["eef_to_goal"].append(base_goal_vector)
-
+            t0=time.perf_counter()
             obs, reward, _, reset_buf, *_ = env.step(actions.detach())  # reset中也会调用
+            step_time_ms = (time.perf_counter() - t0) * 1000
+            print(f"Step time: {step_time_ms:.2f} ms")
 
             if global_epi >= 5000:
                 break
@@ -501,10 +684,13 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 height_cmd[reset_buf]     = 0.75
                 target_pos[reset_buf, 2] = torch.rand(n, device=device)*hei_coe + hei_bias  # height
                 target_pos[reset_buf, :2] = torch.rand(n, 2, device=device) * tar_range - tar_range/2# x,y
-                target_pos[reset_buf, 0] += pos_xyz[reset_buf, 0] +5 # x
-                target_pos[reset_buf, 1] += pos_xyz[reset_buf, 1] +5# y
+                target_pos[reset_buf, 0] += pos_xyz[reset_buf, 0]  # x
+                target_pos[reset_buf, 1] += pos_xyz[reset_buf, 1] # y
+                safe_target_pos = Target_generate(pos_xyz+3,tar_range=10,z_range=(0.3,1.3),manager=env.esdf_manager,device=env.device,reset_indices=reset_buf)
+                target_pos[reset_buf]=safe_target_pos
                 env.gym.clear_lines(viewer)
                 for i in range(B):
+                    # draw_target_cross(env, viewer, target_pos[i,:])
                     draw_target_cross(env, viewer, target_pos[i,:])
 
             if reset_ids.numel():
@@ -525,12 +711,14 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 height_cmd[reset_ids]     = 0.75
                 target_pos[reset_ids, 2] = torch.rand(n, device=device)*hei_coe + hei_bias  # height
                 target_pos[reset_ids, :2] = torch.rand(n, 2, device=device) * tar_range - tar_range/2 # x,y
-                target_pos[reset_ids, 0] += pos_xyz[reset_ids, 0] +5# x
-                target_pos[reset_ids, 1] += pos_xyz[reset_ids, 1] +5# y
-                need_reset[reset_ids] = False    # 重置后不再满足“到达”条件   
+                target_pos[reset_ids, 0] += pos_xyz[reset_ids, 0] # x
+                target_pos[reset_ids, 1] += pos_xyz[reset_ids, 1] # y
+                need_reset[reset_ids] = False    # 重置后不再满足“到达”条件 
+                safe_target_pos = Target_generate(pos_xyz+3,tar_range=10,z_range=(0.3,1.3),manager=env.esdf_manager,device=env.device,reset_indices=reset_ids)
+                target_pos[reset_ids]=safe_target_pos
                 env.gym.clear_lines(viewer)
                 for i in range(B):
-                    
+                    # draw_target_cross(env, viewer, target_pos[i,:])
                     draw_target_cross(env, viewer, target_pos[i,:])
                     
             t1=time.perf_counter()
