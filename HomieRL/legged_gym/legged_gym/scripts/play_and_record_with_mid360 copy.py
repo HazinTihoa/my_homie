@@ -113,10 +113,6 @@ def _save_episode(buffer: dict, epi_id: int, out_dir: str):
         obs_grp.create_dataset("qvel",         data=np.stack(buffer["qvel"], 0), compression="gzip")
         obs_grp.create_dataset("eef_to_goal",  data=np.stack(buffer["eef_to_goal"], 0), compression="gzip")
         obs_grp.create_dataset("obs_vel_and_height",  data=np.stack(buffer["obs_vel_and_height"], 0), compression="gzip")
-
-        # 添加点云数据
-        if "point_cloud" in buffer and len(buffer["point_cloud"]) > 0:
-            obs_grp.create_dataset("point_cloud", data=np.stack(buffer["point_cloud"], 0), compression="gzip")
     print(f"wrote episode to {fname}")
 
 def world2base(vec_world, base_yaw):
@@ -381,8 +377,13 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     
+    # Acquire rigid body state tensor
+    # This tensor is populated by the simulation state
     _rb_states = env.gym.acquire_rigid_body_state_tensor(env.sim)
-
+    # Wrap the tensor so we can use it with PyTorch
+    rb_states_pt = gymtorch.wrap_tensor(_rb_states) # Shape: (num_envs * num_bodies_per_env, 13)
+    # Get the number of rigid bodies per robot asset
+    num_links_per_robot = env.num_bodies 
 
     env.commands[:, 0] = x_vel
     env.commands[:, 1] = y_vel
@@ -400,6 +401,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
         device=env.device
     )  # Use this to load from trained pt file
 
+    # Initialize rigid body state tensor
+    _rb_states = env.gym.acquire_rigid_body_state_tensor(env.sim)
+    rb_states_pt = gymtorch.wrap_tensor(_rb_states) # (num_envs * num_links_per_robot, 13)
+    num_links_per_robot = env.num_bodies # Assuming env.num_bodies gives the number of links per robot
 
     # init upper body joint
     waist_yaw_joint = torch.zeros(env.num_envs, 1, device=env.device)  # (B,1)
@@ -411,7 +416,8 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     rb_names = env.gym.get_actor_rigid_body_names(
         env.envs[0], actor_handle
     )  # link names
- 
+    rb_shoulder_index = rb_names.index("right_shoulder_pitch_link")
+    rb_wrist_index = rb_names.index("right_wrist_yaw_link")
 
     device = env.device
     env.reset_idx(torch.arange(env.num_envs).to("cuda:0"))
@@ -419,20 +425,35 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # env.reset_idx(cpu_inds)
 
     arrive_tollerance = 0.5  # pos tollerance
-
+    heading_thresh = 0.16  # yaw 30 degree tollerance
+    max_speed = 1  # max linear speed
+    arm_end_target_err = 0.3
 
     viewer = env.viewer
     env.gym.clear_lines(viewer)
     B      = env.num_envs
 
     torch.manual_seed(42)  # 这里设置种子为42
+    target_pos = torch.empty(B, 3).to(device)
     root = env.root_states          # shape = (B, 13)，B = 并行环境数
+    # pos_xyz     = root[:, 0:3].clone()      # (B, 3)  所有机器人的 (x,y,z)
     pos_xyz = root[:, 0:3].clone().to(device)
 
+    tar_range=3
+    hei_coe= 0.2
+    hei_bias= 0.3
+    # 生成目标位置
+    target_pos[:, :2] = torch.rand(B, 2) * tar_range -tar_range/2# x,y
+    target_pos[:, 0] += pos_xyz[:, 0]# x
+    target_pos[:, 1] += pos_xyz[:, 1]# y
+    target_pos[:, 2] = torch.rand(B)*hei_coe + hei_bias  # height
     safe_target_pos = Target_generate(pos_xyz,tar_range=3,z_range=(0.3,1.3),manager=env.esdf_manager,device=env.device)
-
+    arm_joint_indices = torch.arange(26, 33, dtype=torch.long, device=env.device)
+    # Draw a cross at each target position for every environment
+    err_norms = torch.zeros(B, device=env.device, dtype=torch.float32)
     need_reset = torch.zeros(B, device=env.device, dtype=torch.bool)
     for i in range(B):
+        # draw_target_cross(env, viewer, target_pos[i,:])
         draw_target_cross(env, viewer, safe_target_pos[i,:])
 
     _dof  = env.gym.acquire_dof_state_tensor(env.sim)
@@ -447,7 +468,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # print(f"[ACT‑dataset] writing to {h5_path}")
 
     # 每个并行 env 对应一个缓冲区 & 计数器
-    epi_buf = [dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[], qvel=[], obs_vel_and_height=[], point_cloud=[]) for _ in range(B)]
+    epi_buf = [dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[],qvel=[],obs_vel_and_height=[]) for _ in range(B)]
     global_epi = 0  # 全局 episode id
 
     # indices helpers
@@ -471,11 +492,6 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # esdf_query_fn=make_esdf_query_fn(manager=env.esdf_manager, device=env.device)
     esdf_query_fn=make_esdf_query_fn_torch(manager=env.esdf_manager, device=env.device)
     # env.visualize_esdf()
-    #super_paremeter
-    pos_bias=10
-    z_range=(0.2, 1.3)
-    tar_range=3.0   
-
     try:
         for _ in range(30 * int(env.max_episode_length)):
             env.gym.refresh_dof_state_tensor(env.sim)
@@ -486,55 +502,135 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             rb_tensor  = gymtorch.wrap_tensor(_rb ).view(B, -1, 13)      # (B, L, 13)
             jacobian   = gymtorch.wrap_tensor(_jac).view(B, env.num_bodies, 6, -1)  # (B, L, 6, D)
 
-            # collision_free_nav
-            current_pos_xy = env.root_states[:, :2]
-            current_height = env.root_states[:, 2]
-            qx, qy, qz, qw = env.root_states[:, 3:7].unbind(-1)
+            current_pos_xy = env.root_states[:, :2]  # 只取 x,y
+            qx, qy, qz, qw = env.root_states[:, 3:7].unbind(dim=1)  # 快速拆 4 列，各 (B,)
+            # cal_yaw
             siny_cosp = 2 * (qw * qz + qx * qy)
             cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
-            yaw_current = torch.atan2(siny_cosp, cosy_cosp)
+            yaw_currrent = torch.atan2(siny_cosp, cosy_cosp)
+            target_pos_xy = target_pos[:, :2]  # 只取 x,y
+            dx = target_pos_xy[:, 0].to(device) - current_pos_xy[:, 0].to(device)
+            dy = target_pos_xy[:, 1].to(device) - current_pos_xy[:, 1].to(device)
+            pos_z     = env.root_states[:, 2]      # (B, 1)所有机器人的 (z)
+            eps          = 5e-2
+
+            yaw_target = torch.atan2(dy, dx)
+            dtheta = torch.atan2(torch.sin(yaw_target - yaw_currrent), torch.cos(yaw_target - yaw_currrent))
+            dist = torch.linalg.norm(target_pos_xy - current_pos_xy, dim=1)
+
+            dist_ratio = dist / (dist + 1.0)
+            vx_nominal = dist_ratio * max_speed                    # (B,)
+            yaw      = torch.clamp(dtheta * 3.0, -1.0, 1.0)
+            height_tar = torch.clamp(target_pos[:, 2], 0.2, 0.8)   # (B,)
+            idle_height = torch.full((B,), 0.75, device=device)
+
+            need_turn     = (torch.abs(dtheta) >= heading_thresh)      # (B,)
+            need_approach = (dist >= arrive_tollerance)                       # (B,)
+            no_need_turn   = torch.abs(dtheta) <= heading_thresh+0.3
+            no_need_approach = dist <= arrive_tollerance+0.1
+
+            yaw_cmd  = torch.where(need_turn, yaw, torch.zeros_like(yaw))
+            vx_cmd  = torch.where(need_approach, vx_nominal,torch.zeros_like(vx_nominal))
+            height_cmd  = torch.where(no_need_turn&no_need_approach,  height_tar, pos_z)
             
-            nav_out = navigator.select_and_track(
-                base_pos_xy=current_pos_xy,
-                base_yaw=yaw_current,
-                target_pos_xy=safe_target_pos[:, :2],
-                esdf_query_fn=esdf_query_fn
-            )
+            no_need_height =torch.abs(pos_z - height_cmd) < eps
+            need_arm_ik=torch.where(no_need_turn&no_need_approach&no_need_height,True,False) 
+            ik_cal_idx  = torch.nonzero(need_arm_ik).squeeze(1)  # (k,)
 
-            vx_cmd = nav_out['vx']  # (B,)
-            yaw_cmd = nav_out['wz']  # (B,)
-            height_cmd = torch.full((B,), 0.75, device=device)
+            if False:
+                if ik_cal_idx.numel():
+                    n= ik_cal_idx.numel()
+                    for env_idx in ik_cal_idx:
+                        target_pos_ik = target_pos[env_idx, :].cpu().numpy()  # 之后转为gpu计算
+            
+                        dof_states = env.gym.acquire_dof_state_tensor(env.sim)
+                        dof_state_tensor = gymtorch.wrap_tensor(dof_states)
+                        env.gym.refresh_dof_state_tensor(env.sim)          # ← 一定别忘了刷新！
+                        dof_state_tensor = dof_state_tensor.view(env.num_envs,-1 ,2)
+                        q_init_7dof = dof_state_tensor[env_idx, 20:27, 0] 
+
+                        q_new, err_norm = solve_right_arm_ik_jacobian(
+                                env,
+                                env_idx,
+                                env.actor_handles[env_idx],
+                                rb_wrist_index,
+                                arm_joint_indices,
+                                target_pos_ik,
+                                q_init_7dof,
+                            )  #  arm joint get
+                        # print("q_new:", q_new)
+                        right_arm_joint[env_idx,:] = torch.tensor(q_new, dtype=torch.float32) * 4
+                        err_norms[env_idx]= err_norm
+                        if err_norms[env_idx] < arm_end_target_err:
+                            need_reset[env_idx] = True
+                else:
+                    err_norms[:] = float('inf')
+            else:
+
+                if ik_cal_idx.numel():
+                    k = ik_cal_idx.numel()
+
+                    # --- (1) 收集状态 ----------------------------------------------------
+                    q_init_7dof = dof_tensor[ik_cal_idx, 20:27, 0]               # (k, 7)
+                    wrist_pos   = rb_tensor[ik_cal_idx, rb_wrist_index, 0:3]     # (k, 3)
+                    target_xyz  = target_pos[ik_cal_idx]                         # (k, 3)
+                    pos_err     = target_xyz - wrist_pos                         # (k, 3)
+                    err_norms[ik_cal_idx] = torch.linalg.norm(pos_err, dim=1)
+
+                    # --- (2) 构造 6×7 Jacobian -----------------------------------------
+                    J = jacobian[ik_cal_idx, rb_wrist_index, :6]                 # (k, 6, dof)
+                    J = J[:, :, arm_joint_indices].contiguous()                  # (k, 6, 7)
+
+                    # --- (3) Damped Least Squares 求 Δq -------------------------------
+                    lambda_sq = 0.05 ** 2
+                    JJT       = torch.matmul(J, J.transpose(-1, -2))             # (k, 6, 6)
+                    reg_eye   = torch.eye(6, device=device).expand(k, 6, 6) * lambda_sq
+                    inv_term  = torch.linalg.inv(JJT + reg_eye)                  # (k, 6, 6)
+                    dpose6    = torch.zeros(k, 6, 1, device=device)
+                    dpose6[:, 0:3, 0] = pos_err                                  # 位置误差
+                    dq        = torch.matmul(J.transpose(-1, -2),
+                                            torch.matmul(inv_term, dpose6)).squeeze(-1)  # (k, 7)
+
+                    # --- (4) 写回动作 ---------------------------------------------------
+                    right_arm_joint[ik_cal_idx] = (q_init_7dof + 0.2 * dq) * 4
+
+                    # --- (5) 更新 need_reset ------------------------------------------
+                    need_reset[ik_cal_idx] = err_norms[ik_cal_idx] < arm_end_target_err
+                else:
+                    err_norms[:] = float('inf')
 
 
-            dist_to_goal = torch.linalg.norm(safe_target_pos[:, :2] - current_pos_xy, dim=1)
+            # collision_free_nav
+            if True:
+                current_pos_xy = env.root_states[:, :2]
+                qx, qy, qz, qw = env.root_states[:, 3:7].unbind(-1)
+                siny_cosp = 2 * (qw * qz + qx * qy)
+                cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+                yaw_current = torch.atan2(siny_cosp, cosy_cosp)
+                
+                # 选轨并跟踪 -> 得到 (vx, wz)
+                t0 = time.perf_counter()
+   
+                nav_out = navigator.select_and_track(
+                    base_pos_xy=current_pos_xy,
+                    base_yaw=yaw_current,
+                    target_pos_xy=target_pos[:, :2],
+                    esdf_query_fn=esdf_query_fn
+                )
+                t1 = time.perf_counter()
+                # print(f"nav time: {(t1-t0)*1000:.2f} ms")
 
-            # 找到到达目标位置的环境
-            arrived_mask = dist_to_goal < arrive_tollerance
-            arrived_ids = torch.nonzero(arrived_mask).squeeze(1)
-            env.commands[:, 0] = vx_cmd      # vx
-            env.commands[:, 1] = torch.zeros(B, dtype=torch.float32) # vy all zeros
-            env.commands[:, 2] = yaw_cmd      # wz
-            env.commands[:, 4] = height_cmd         # height
+                env.commands[:, 0] = nav_out['vx']      # vx
+                env.commands[:, 2] = nav_out['wz']      # wz
 
-            if arrived_ids.numel() > 0:
-                # 只对到达的环境设置命令
-                vx_cmd[arrived_ids] = 0.0
-                yaw_cmd[arrived_ids] = 0.0
-                height_cmd[arrived_ids] = safe_target_pos[arrived_ids, 2].clamp(0.2, 0.8)
+            #previous cmd
+            # env.commands[:, 0] = vx_cmd
+            # env.commands[:, 2] = yaw_cmd
+            # env.commands[:, 0] = 0
+            # env.commands[:, 2] = 0
 
-                env.commands[arrived_ids, 0] = vx_cmd[arrived_ids]  # vx = 0
-                env.commands[arrived_ids, 2] = yaw_cmd[arrived_ids]  # wz = 0
-                env.commands[arrived_ids, 4] = height_cmd[arrived_ids]  # height
-                # 检查哪些环境的高度也到达了
-                current_height = env.root_states[:, 2]  # 当前高度
-                height_diff = torch.abs(current_height[arrived_ids] - env.commands[arrived_ids, 4])
-                height_arrived_mask = height_diff < 0.03
-
-                # 只对同时满足位置和高度条件的环境置为需要重置
-                final_arrived_ids = arrived_ids[height_arrived_mask]
-                if final_arrived_ids.numel() > 0:
-                    need_reset[final_arrived_ids] = True
-
+            env.commands[:, 1] = torch.zeros(B, dtype=torch.float32)
+            env.commands[:, 4] = height_cmd  # height
 
             actions = policy(obs.detach())
             left_arm_joint = left_arm_joint.view(B, -1)
@@ -551,16 +647,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             s_height = env.root_states[:, 2]   # (B,)
 
             wrist_pos = rb_tensor[0, wrist_idx, 0:3].cpu().numpy()
-            goal_pos = safe_target_pos[0].cpu().numpy()
+            goal_pos = target_pos[0].cpu().numpy()
             goal=goal_pos-wrist_pos
-
-            # 获取点云数据（如果环境支持）
-            point_clouds = None
-            if env.lidar_tensor is not None:
-                # 获取激光雷达点云数据
-                point_clouds = env.lidar_tensor.view(B,-1,3)  # 假设返回 (B, N, 3) 格式的点云
-
-
+         
+            # print("goal:",torch.norm(torch.tensor(goal))) 
             for i in range(B):
                 # 动作 & qpos
                 # cmd
@@ -573,18 +663,10 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 obs_vec = np.stack([s_vx[i].cpu().numpy(), s_wz[i].cpu().numpy(), s_height[i].cpu().numpy()], axis=-1)
                 epi_buf[i]["obs_vel_and_height"].append(obs_vec)
                 wrist_pos = rb_tensor[i, wrist_idx, 0:3].cpu().numpy()
-                goal_pos = safe_target_pos[i].cpu().numpy()
+                goal_pos = target_pos[i].cpu().numpy()
                 world_goal_vector=goal_pos - wrist_pos
-                base_goal_vector=world2base(world_goal_vector,yaw_current[i].item())
+                base_goal_vector=world2base(world_goal_vector,yaw_currrent[i].item())
                 epi_buf[i]["eef_to_goal"].append(base_goal_vector)
-
-                # 添加点云数据
-                if point_clouds is not None:
-                    pc_data = point_clouds[i].detach().cpu().numpy()
-                    epi_buf[i]["point_cloud"].append(pc_data)
-                else:
-                    # 如果没有点云数据，添加空数组占位
-                    epi_buf[i]["point_cloud"].append(np.array([]))
             t0=time.perf_counter()
             obs, reward, _, reset_buf, *_ = env.step(actions.detach())  # reset中也会调用
             step_time_ms = (time.perf_counter() - t0) * 1000
@@ -597,19 +679,22 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             
             if reset_buf.numel()>0:
                 # env.reset_idx(reset_buf.cuda())        # 物理重置
-                right_arm_joint[reset_buf,:] = torch.zeros(7, dtype=torch.float32,device=device) #reset arm
-                height_cmd[reset_buf]     = 0.75 #reset height
-
-                new_safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_buf)
-                safe_target_pos[reset_buf]=new_safe_target_pos
+                n= reset_buf.numel()
+                right_arm_joint[reset_buf,:] = torch.zeros(7, dtype=torch.float32,device=device)
+                height_cmd[reset_buf]     = 0.75
+                target_pos[reset_buf, 2] = torch.rand(n, device=device)*hei_coe + hei_bias  # height
+                target_pos[reset_buf, :2] = torch.rand(n, 2, device=device) * tar_range - tar_range/2# x,y
+                target_pos[reset_buf, 0] += pos_xyz[reset_buf, 0]  # x
+                target_pos[reset_buf, 1] += pos_xyz[reset_buf, 1] # y
+                safe_target_pos = Target_generate(pos_xyz+3,tar_range=10,z_range=(0.3,1.3),manager=env.esdf_manager,device=env.device,reset_indices=reset_buf)
+                target_pos[reset_buf]=safe_target_pos
                 env.gym.clear_lines(viewer)
                 for i in range(B):
-                    draw_target_cross(env, viewer, safe_target_pos[i,:])
+                    # draw_target_cross(env, viewer, target_pos[i,:])
+                    draw_target_cross(env, viewer, target_pos[i,:])
 
             if reset_ids.numel():
                 for idx in reset_ids.cpu().tolist():
-       
-                    # 写入 episode 数据
                     if 0 < len(epi_buf[idx]['upper_actions']) <=1000:               # 防止空 episode
                         flush_start_time = time.time()
                         _save_episode(epi_buf[idx], global_epi, out_dir)                
@@ -618,19 +703,26 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                         global_epi += 1
                         for key in epi_buf[idx]:
                             epi_buf[idx][key] = []  
-                        epi_buf[idx] = dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[], qvel=[], obs_vel_and_height=[], point_cloud=[])
+                        epi_buf[idx] = dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[],qvel=[],obs_vel_and_height=[])
 
                 env.reset_idx(reset_ids.cuda())        # 物理重置
-                right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32,device=device) #reset arm
-                height_cmd[reset_ids]     = 0.75 #reset height
-
+                n= reset_ids.numel()
+                right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32,device=device)
+                height_cmd[reset_ids]     = 0.75
+                target_pos[reset_ids, 2] = torch.rand(n, device=device)*hei_coe + hei_bias  # height
+                target_pos[reset_ids, :2] = torch.rand(n, 2, device=device) * tar_range - tar_range/2 # x,y
+                target_pos[reset_ids, 0] += pos_xyz[reset_ids, 0] # x
+                target_pos[reset_ids, 1] += pos_xyz[reset_ids, 1] # y
                 need_reset[reset_ids] = False    # 重置后不再满足“到达”条件 
-                new_safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_ids)
-                safe_target_pos[reset_ids]=new_safe_target_pos
+                safe_target_pos = Target_generate(pos_xyz+3,tar_range=10,z_range=(0.3,1.3),manager=env.esdf_manager,device=env.device,reset_indices=reset_ids)
+                target_pos[reset_ids]=safe_target_pos
                 env.gym.clear_lines(viewer)
                 for i in range(B):
-                    draw_target_cross(env, viewer, safe_target_pos[i,:])
-
+                    # draw_target_cross(env, viewer, target_pos[i,:])
+                    draw_target_cross(env, viewer, target_pos[i,:])
+                    
+            t1=time.perf_counter()
+            # print(f"per frame time: {(t1-t0)*1000:.2f} ms")
     finally:
  
         print(f"=========================")
