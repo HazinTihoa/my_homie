@@ -585,10 +585,10 @@ class LeggedRobot(BaseTask):
                        xyz=pos, quat_xyzw=quat)
 
         if self.sensor_update_time + 1e-9 > 1/self.sensor_cfg.update_frequency:
-            # self.gym.clear_lines(self.viewer)
+            self.gym.clear_lines(self.viewer)
             if self.downsampled_cloud is not None:
                 pass
-                # self._draw_lidar_vis()
+                self._draw_lidar_vis()
                 # self.visualize_esdf()
             # self._visualize_terrain_vertices()
 

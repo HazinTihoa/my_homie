@@ -6,6 +6,8 @@ from legged_gym.utils import get_args, export_policy_as_jit, task_registry, Logg
 import numpy as np
 import time
 import torch
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 from isaacgym import gymapi
 from isaacgym import gymtorch
@@ -104,20 +106,28 @@ def draw_target_cross(env, viewer, target_pos, sphere_radius=0.08, sphere_color=
         gymutil.draw_lines(sphere_geom, env.gym, viewer, env_handle, sphere_pose)
 
 def _save_episode(buffer: dict, epi_id: int, out_dir: str):
-    fname = os.path.join(out_dir, f"episode_{epi_id}.hdf5")
-    with h5py.File(fname, "w") as h5file:
-        obs_grp = h5file.require_group("observations")
-        h5file.create_dataset("upper_actions", data=np.stack(buffer["upper_actions"], 0), compression="gzip")
-        h5file.create_dataset("cmd_vel_and_height", data=np.stack(buffer["cmd_vel_and_height"], 0), compression="gzip")
-        obs_grp.create_dataset("qpos",         data=np.stack(buffer["qpos"], 0), compression="gzip")
-        obs_grp.create_dataset("qvel",         data=np.stack(buffer["qvel"], 0), compression="gzip")
-        obs_grp.create_dataset("eef_to_goal",  data=np.stack(buffer["eef_to_goal"], 0), compression="gzip")
-        obs_grp.create_dataset("obs_vel_and_height",  data=np.stack(buffer["obs_vel_and_height"], 0), compression="gzip")
+    """同步保存episode数据（在线程中调用）"""
+    try:
+        fname = os.path.join(out_dir, f"episode_{epi_id}.hdf5")
+        t_start = time.time()
 
-        # 添加点云数据
-        if "point_cloud" in buffer and len(buffer["point_cloud"]) > 0:
-            obs_grp.create_dataset("point_cloud", data=np.stack(buffer["point_cloud"], 0), compression="gzip")
-    print(f"wrote episode to {fname}")
+        with h5py.File(fname, "w") as h5file:
+            obs_grp = h5file.require_group("observations")
+            h5file.create_dataset("upper_actions", data=np.stack(buffer["upper_actions"], 0), compression="lzf")
+            h5file.create_dataset("cmd_vel_and_height", data=np.stack(buffer["cmd_vel_and_height"], 0), compression="lzf")
+            obs_grp.create_dataset("qpos",         data=np.stack(buffer["qpos"], 0), compression="lzf")
+            obs_grp.create_dataset("qvel",         data=np.stack(buffer["qvel"], 0), compression="lzf")
+            obs_grp.create_dataset("eef_to_goal",  data=np.stack(buffer["eef_to_goal"], 0), compression="lzf")
+            obs_grp.create_dataset("obs_vel_and_height",  data=np.stack(buffer["obs_vel_and_height"], 0), compression="lzf")
+
+            # 添加点云数据
+            if "point_cloud" in buffer and len(buffer["point_cloud"]) > 0:
+                obs_grp.create_dataset("point_cloud", data=np.stack(buffer["point_cloud"], 0).astype(np.float16), compression="lzf")
+
+        elapsed = time.time() - t_start
+        print(f"[ACT-dataset] Saved episode {epi_id} with {len(buffer['upper_actions'])} steps to {fname} (took {elapsed:.2f}s)")
+    except Exception as e:
+        print(f"[ERROR] Failed to save episode {epi_id}: {e}")
 
 def world2base(vec_world, base_yaw):
     c, s = np.cos(-base_yaw), np.sin(-base_yaw)
@@ -429,7 +439,11 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     root = env.root_states          # shape = (B, 13)，B = 并行环境数
     pos_xyz = root[:, 0:3].clone().to(device)
 
-    safe_target_pos = Target_generate(pos_xyz,tar_range=3,z_range=(0.3,1.3),manager=env.esdf_manager,device=env.device)
+
+    pos_bias=5
+    z_range=(0.2, 1.0)
+    tar_range=3.0
+    safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device)
 
     need_reset = torch.zeros(B, device=env.device, dtype=torch.bool)
     for i in range(B):
@@ -439,16 +453,19 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     _rb   = env.gym.acquire_rigid_body_state_tensor(env.sim)
     _jac  = env.gym.acquire_jacobian_tensor(env.sim, env.cfg.asset.name)
 
-   # -------- 2. 打开 HDF5 文件 --------
+   # -------- 2. 创建异步保存线程池 --------
     out_dir = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "act_dataset")
     os.makedirs(out_dir, exist_ok=True)
-    # h5_path = os.path.join(out_dir, time.strftime("%Y%m%d-%H%M%S_act.hdf5"))
-    # h5f = h5py.File(h5_path, "w")
-    # print(f"[ACT‑dataset] writing to {h5_path}")
+
+    # 创建线程池用于异步保存（最多4个并发保存任务）
+    save_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="EpisodeSaver")
+    save_futures = []  # 跟踪正在进行的保存任务
 
     # 每个并行 env 对应一个缓冲区 & 计数器
     epi_buf = [dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[], qvel=[], obs_vel_and_height=[], point_cloud=[]) for _ in range(B)]
     global_epi = 0  # 全局 episode id
+
+    print(f"[ACT-dataset] Async saving enabled with ThreadPoolExecutor (max_workers=4)")
 
     # indices helpers
     rb_names = env.gym.get_actor_rigid_body_names(env.envs[0], env.actor_handles[0])
@@ -472,9 +489,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     esdf_query_fn=make_esdf_query_fn_torch(manager=env.esdf_manager, device=env.device)
     # env.visualize_esdf()
     #super_paremeter
-    pos_bias=10
-    z_range=(0.2, 1.3)
-    tar_range=3.0   
+
 
     try:
         for _ in range(30 * int(env.max_episode_length)):
@@ -528,7 +543,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 # 检查哪些环境的高度也到达了
                 current_height = env.root_states[:, 2]  # 当前高度
                 height_diff = torch.abs(current_height[arrived_ids] - env.commands[arrived_ids, 4])
-                height_arrived_mask = height_diff < 0.03
+                height_arrived_mask = height_diff < 0.08
 
                 # 只对同时满足位置和高度条件的环境置为需要重置
                 final_arrived_ids = arrived_ids[height_arrived_mask]
@@ -560,7 +575,8 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 # 获取激光雷达点云数据
                 point_clouds = env.lidar_tensor.view(B,-1,3)  # 假设返回 (B, N, 3) 格式的点云
 
-
+            env.gym.clear_lines(env.viewer)
+            env._draw_lidar_vis()
             for i in range(B):
                 # 动作 & qpos
                 # cmd
@@ -588,51 +604,81 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             t0=time.perf_counter()
             obs, reward, _, reset_buf, *_ = env.step(actions.detach())  # reset中也会调用
             step_time_ms = (time.perf_counter() - t0) * 1000
-            print(f"Step time: {step_time_ms:.2f} ms")
+            # print(f"Step time: {step_time_ms:.2f} ms")
 
             if global_epi >= 5000:
                 break
             reset_ids  = torch.nonzero(need_reset).squeeze(1)
             reset_buf = torch.nonzero(reset_buf).squeeze(1)
-            
+            # Print number of steps in env 0's current episode buffer
+            env0_steps = len(epi_buf[0]["upper_actions"])
+            # print(f"Env 0 current episode steps: {env0_steps}")
             if reset_buf.numel()>0:
-                # env.reset_idx(reset_buf.cuda())        # 物理重置
+                # 清空失败/超时环境的buffer（不保存）
+                for idx in reset_buf.cpu().tolist():
+                    epi_buf[idx] = dict(upper_actions=[], cmd_vel_and_height=[], qpos=[],
+                                       eef_to_goal=[], qvel=[], obs_vel_and_height=[], point_cloud=[])
+
+                env.reset_idx(reset_buf.cuda())        # 物理重置
                 right_arm_joint[reset_buf,:] = torch.zeros(7, dtype=torch.float32,device=device) #reset arm
                 height_cmd[reset_buf]     = 0.75 #reset height
 
                 new_safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_buf)
                 safe_target_pos[reset_buf]=new_safe_target_pos
-                env.gym.clear_lines(viewer)
-                for i in range(B):
-                    draw_target_cross(env, viewer, safe_target_pos[i,:])
+
+                # env.gym.clear_lines(viewer)
+                # for i in range(B):
+                #     draw_target_cross(env, viewer, safe_target_pos[i,:])
 
             if reset_ids.numel():
                 for idx in reset_ids.cpu().tolist():
-       
-                    # 写入 episode 数据
-                    if 0 < len(epi_buf[idx]['upper_actions']) <=1000:               # 防止空 episode
-                        flush_start_time = time.time()
-                        _save_episode(epi_buf[idx], global_epi, out_dir)                
-                        consume_time = time.time()-flush_start_time
-                        print(f"[ACT‑dataset] wrote episode {global_epi} with {len(epi_buf[idx]['upper_actions'])} steps,time cost: {consume_time:.6f} seconds")
+                    # 异步保存 episode 数据
+                    if 0 < len(epi_buf[idx]['upper_actions']) :               # 防止空 episode
+                        # 深拷贝buffer数据（避免后续修改影响保存）
+                        buffer_to_save = {
+                            'upper_actions': epi_buf[idx]['upper_actions'][:],
+                            'cmd_vel_and_height': epi_buf[idx]['cmd_vel_and_height'][:],
+                            'qpos': epi_buf[idx]['qpos'][:],
+                            'qvel': epi_buf[idx]['qvel'][:],
+                            'eef_to_goal': epi_buf[idx]['eef_to_goal'][:],
+                            'obs_vel_and_height': epi_buf[idx]['obs_vel_and_height'][:],
+                            'point_cloud': epi_buf[idx]['point_cloud'][:]
+                        }
+
+                        # 提交到线程池异步保存
+                        future = save_executor.submit(_save_episode, buffer_to_save, global_epi, out_dir)
+                        save_futures.append(future)
+                        print(f"[ACT-dataset] Submitted episode {global_epi} with {len(buffer_to_save['upper_actions'])} steps for async saving")
                         global_epi += 1
-                        for key in epi_buf[idx]:
-                            epi_buf[idx][key] = []  
+
+                        # 清空当前环境的buffer
                         epi_buf[idx] = dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[], qvel=[], obs_vel_and_height=[], point_cloud=[])
 
                 env.reset_idx(reset_ids.cuda())        # 物理重置
-                right_arm_joint[reset_ids,:] = torch.zeros(7, dtype=torch.float32,device=device) #reset arm
                 height_cmd[reset_ids]     = 0.75 #reset height
-
                 need_reset[reset_ids] = False    # 重置后不再满足“到达”条件 
+
                 new_safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_ids)
                 safe_target_pos[reset_ids]=new_safe_target_pos
-                env.gym.clear_lines(viewer)
-                for i in range(B):
-                    draw_target_cross(env, viewer, safe_target_pos[i,:])
+
+                # env.gym.clear_lines(viewer)
+                # for i in range(B):
+                #     draw_target_cross(env, viewer, safe_target_pos[i,:])
+            for i in range(B):
+                draw_target_cross(env, viewer, safe_target_pos[i,:])
 
     finally:
- 
+        # 等待所有保存任务完成
+        print(f"\n[ACT-dataset] Waiting for {len(save_futures)} pending save tasks to complete...")
+        for i, future in enumerate(save_futures):
+            try:
+                future.result(timeout=300)  # 每个任务最多等5分钟
+            except Exception as e:
+                print(f"[ERROR] Save task {i} failed: {e}")
+
+        # 关闭线程池
+        save_executor.shutdown(wait=True)
+        print(f"[ACT-dataset] All episodes saved. Total: {global_epi}")
         print(f"=========================")
 
 if __name__ == "__main__":
