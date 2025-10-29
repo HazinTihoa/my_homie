@@ -189,7 +189,15 @@ class PcBridgeClient:
             finally:
                 self.sock = None
 
-
+class bcolors:
+    HEADER = '\033[95m'     # 粉红
+    OKBLUE = '\033[94m'     # 蓝色
+    OKGREEN = '\033[92m'    # 绿色
+    WARNING = '\033[93m'    # 黄色
+    FAIL = '\033[91m'       # 红色
+    ENDC = '\033[0m'        # 结束颜色
+    BOLD = '\033[1m'        # 粗体
+    UNDERLINE = '\033[4m'   # 下划线
 class LeggedRobot(BaseTask):
     def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
         """ Parses the provided config file,
@@ -212,7 +220,7 @@ class LeggedRobot(BaseTask):
 
         self.sensor_cfg = LidarConfig()
         self.sensor_cfg.sensor_type ="mid360" # mid360,horizon,HAP,mid70,mid40,tele,avia
-        self.sensor_cfg.max_range = 3.0  # 增加扫描范围到1米
+        self.sensor_cfg.max_range = 40.0  # 增加扫描范围到40米
         self.sim_time = 0
         self.sensor_update_time = 0
         self.state_update_time = 0
@@ -302,7 +310,7 @@ class LeggedRobot(BaseTask):
                 y = y_valid[i]
                 
                 # ESDF值处理：
-                # 正值 = 距离障碍物的距离（自由空间）
+                # 正值 = 跆离障碍物的距离（自由空间）
                 # 负值 = 在障碍物内部（用绝对值表示深度）
                 if distance < 0:
                     # 在障碍物内部，用深红色表示
@@ -327,7 +335,7 @@ class LeggedRobot(BaseTask):
             # print("深红色=障碍物内部, 红色=危险(近距离), 黄色=中等距离, 绿色=安全(2m+)")
             
             # 绘制ESDF地图的四个顶点边界，用蓝色表示
-            # self._draw_esdf_corners(z_height)
+            self._draw_esdf_corners(z_height)
             
         except Exception as e:
             print(f"ESDF可视化失败: {e}")
@@ -386,7 +394,7 @@ class LeggedRobot(BaseTask):
             for i, (x, y, z) in enumerate(corners):
                 sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
                 gymutil.draw_lines(corner_sphere_geom, self.gym, self.viewer, self.envs[0], sphere_pose)
-            
+            print(f"{bcolors.OKBLUE}ESDF地图边界顶点坐标：{corners}{bcolors.OKBLUE}")
             print(f"ESDF边界顶点已绘制：({min_x:.2f},{min_y:.2f}) 到 ({max_x:.2f},{max_y:.2f})")
             print(f"地图尺寸：{map_width}×{map_height} 格子，分辨率：{resolution}m")
             
@@ -493,7 +501,7 @@ class LeggedRobot(BaseTask):
                     
             self.wp_meshes =  wp.Mesh(points=vertex_vec3_array,indices=faces_wp_int32_array)
             
-            self.mesh_ids = self.mesh_ids_array = wp.array([self.wp_meshes.id], dtype=wp.uint64)
+            self.mesh_ids = self.mesh_ids_array = wp.array([self.wp_meshes.id], dtype=wp.uint64,device=self.device)
     
 
 
@@ -564,36 +572,59 @@ class LeggedRobot(BaseTask):
         self.sensor_pos_tensor[:]  = self.base_pose[:, :3] + quat_apply(self.base_quat, self.sensor_translation)
         self.lidar_tensor, self.sensor_dist_tensor = self.sensor.update()
 
+
         pts = self.lidar_tensor.view(self.num_envs, -1, 3)
-        pts0=pts[0].detach().contiguous().to('cpu', dtype=torch.float32).numpy()
-        # print("lidar points:", pts.shape)
-        # print("base", self.base_pose[0, :3])
-        down, _ = sample_farthest_points(pts, K=min(300, pts.shape[1]))
-
-        self.downsampled_cloud = down.view(self.num_envs, 1, down.shape[1], 3)
-        env_id = getattr(self, "selected_env_idx", 0)  # 选择要发的那个 env
- 
-        pts_np = self.downsampled_cloud[env_id, 0].detach().contiguous().to('cpu', dtype=torch.float32).numpy()  # (K,3)
-        # if getattr(self, "_pc_send_step", 0) % 3 == 0:
-        self.pc_bridge.send_points(pts0, frame_id="mid_360")  # frame_id 和 RViz Fixed Frame 对齐
-        # self._pc_send_step = getattr(self, "_pc_send_step", 0) + 1
 
 
-        pos = self.sensor_pos_tensor[env_id].detach().to('cpu').numpy()      # (3,)
-        quat = self.sensor_quat_tensor[env_id].detach().to('cpu').numpy()    # (4,) xyzw
-        self.pc_bridge.send_tf(parent_frame="map", child_frame="mid_360",
-                       xyz=pos, quat_xyzw=quat)
+
+        if True:
+            pts_dists = torch.norm(pts, dim=2)  # [num_envs, num_points]
+            mask = pts_dists < 5  # [num_envs, num_points] # 只取距离<5m的有效点
+            # 固定采样点数，减少点云数量
+            K = 8192  # 每个环境固定采样的点数
+            pts_filtered_list = []
+
+            for env_idx in range(self.num_envs):
+                valid_pts = pts[env_idx][mask[env_idx]]  # 只取距离<5m的有效点
+                num_valid = valid_pts.shape[0]
+
+                if num_valid >= K:
+                    # 如果有效点数>=K，随机采样K个点
+                    indices = torch.randperm(num_valid, device=pts.device)[:K]
+                    sampled_pts = valid_pts[indices]
+                else:
+                    # 如果有效点数<K，用零填充到K个点
+                    padding = torch.zeros(K - num_valid, 3, device=pts.device, dtype=pts.dtype)
+                    sampled_pts = torch.cat([valid_pts, padding], dim=0)
+                pts_filtered_list.append(sampled_pts)
+
+            down = torch.stack(pts_filtered_list, dim=0)  # [num_envs, K, 3]
+            # down, _ = sample_farthest_points(down, K=min(100, pts.shape[1]))
+            pts0 = pts_filtered_list[0][:mask[0].sum().item()].detach().contiguous().to('cpu', dtype=torch.float32).numpy()
+            self.pc_bridge.send_points(pts0, frame_id="mid_360")
+            self.downsampled_cloud = down.view(self.num_envs, down.shape[1], 3)
+        else:
+            down, _ = sample_farthest_points(pts, K=min(1000, pts.shape[1]))
+            self.downsampled_cloud = down.view(self.num_envs, down.shape[1], 3)
+            pts_np = self.downsampled_cloud[0].detach().contiguous().to('cpu', dtype=torch.float32).numpy()  # (K,3)
+            self.pc_bridge.send_points(pts_np, frame_id="mid_360") 
+
+
+
+        pos = self.sensor_pos_tensor[0].detach().to('cpu').numpy()      # (3,)
+        quat = self.sensor_quat_tensor[0].detach().to('cpu').numpy()    # (4,) xyzw
+        self.pc_bridge.send_tf(parent_frame="map", child_frame="mid_360",xyz=pos, quat_xyzw=quat)
 
         if self.sensor_update_time + 1e-9 > 1/self.sensor_cfg.update_frequency:
             self.gym.clear_lines(self.viewer)
             if self.downsampled_cloud is not None:
-                pass
-                self._draw_lidar_vis()
+                # self._draw_lidar_vis()
                 # self.visualize_esdf()
+                pass
             # self._visualize_terrain_vertices()
 
             self.sensor_update_time = 0.0
-        self.downsampled_cloud= None
+        # self.downsampled_cloud= None
         # return clipped obs, clipped states (None), rewards, dones and infos
         clip_obs = self.cfg.normalization.clip_observations
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
@@ -1378,6 +1409,7 @@ class LeggedRobot(BaseTask):
     def refresh_actor_rigid_shape_props(self, env_ids):
         if self.cfg.domain_rand.randomize_friction:
             self.friction_coeffs[env_ids] = torch_rand_float(self.cfg.domain_rand.friction_range[0], self.cfg.domain_rand.friction_range[1], (len(env_ids), 1), device=self.device)
+
         if self.cfg.domain_rand.randomize_restitution:
             self.restitution_coeffs[env_ids] = torch_rand_float(self.cfg.domain_rand.restitution_range[0], self.cfg.domain_rand.restitution_range[1], (len(env_ids), 1), device=self.device)
         
@@ -1539,6 +1571,82 @@ class LeggedRobot(BaseTask):
                                               gymtorch.unwrap_tensor(self.dof_state),
                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
         
+    def _generate_safe_reset_positions(self, env_ids, map_range=(0.0, 30.0), z_range=(0.75, 0.85), safe_clearance=0.3, max_attempts=100):
+        """
+        生成安全的重置位置，确保：
+        1. 在地图范围内（0-30米）
+        2. 不与障碍物碰撞（使用ESDF检查）
+        3. 在合适的高度上
+
+        Args:
+            env_ids: 需要重置的环境ID
+            map_range: (min, max) 地图xy方向的绝对范围（米）
+            z_range: z高度范围
+            safe_clearance: 与障碍物的最小安全距离（米）
+            max_attempts: 每个环境最大尝试次数
+
+        Returns:
+            safe_positions: [n, 3] 安全的位置
+        """
+        n = len(env_ids)
+        min_z, max_z = z_range
+        map_min, map_max = map_range
+        safe_positions = torch.zeros(n, 3, device=self.device)
+
+        # 获取每个环境的origin作为参考点（用于z坐标）
+        env_origins = self.env_origins[env_ids]  # [n, 3]
+
+        # 使用ESDF检查安全性
+        if hasattr(self, 'esdf_manager') and self.esdf_manager is not None:
+            esdf_data = torch.from_numpy(self.esdf_manager.esdf).to(self.device)  # [H, W]
+            H, W = esdf_data.shape
+            res = float(self.esdf_manager.map_resolution)
+            ox, oy = map(float, self.esdf_manager.origin)
+
+            for i, env_id in enumerate(env_ids):
+                origin = env_origins[i]
+                found_safe = False
+
+                for attempt in range(max_attempts):
+                    # 在整个地图范围内随机采样xy（0-30米）
+                    rand_xy = torch_rand_float(map_min, map_max, (1, 2), device=self.device)
+                    candidate_x = rand_xy[0, 0]
+                    candidate_y = rand_xy[0, 1]
+
+                    # 转换到像素坐标
+                    px = int((candidate_x - ox) / res)
+                    py = int((candidate_y - oy) / res)
+
+                    # 检查是否在地图范围内
+                    if 0 <= px < W and 0 <= py < H:
+                        # 检查ESDF值（距离障碍物的距离）
+                        clearance = esdf_data[py, px].item()
+
+                        if clearance >= safe_clearance:
+                            # 找到安全位置
+                            safe_positions[i, 0] = candidate_x
+                            safe_positions[i, 1] = candidate_y
+                            safe_positions[i, 2] = origin[2] + torch.rand(1, device=self.device).item() * (max_z - min_z) + min_z
+                            found_safe = True
+                            break
+
+                if not found_safe:
+                    # 如果没找到安全位置，使用origin附近的位置
+                    safe_positions[i] = origin
+                    safe_positions[i, 2] = origin[2] + (min_z + max_z) / 2
+                    print(f"{bcolors.WARNING}[WARNING] Could not find safe reset position for env {env_id.item()}, using origin{bcolors.ENDC}")
+        else:
+            # 如果没有ESDF，在整个地图范围内随机采样
+            for i in range(n):
+                origin = env_origins[i]
+                rand_xy = torch_rand_float(map_min, map_max, (1, 2), device=self.device)
+                safe_positions[i, 0] = rand_xy[0, 0]
+                safe_positions[i, 1] = rand_xy[0, 1]
+                safe_positions[i, 2] = origin[2] + torch.rand(1, device=self.device).item() * (max_z - min_z) + min_z
+            print(f"{bcolors.INFO}[WARNING] ESDF manager not available, using simple randomization for reset positions{bcolors.ENDC}")
+
+        return safe_positions
+
     def _reset_root_states(self, env_ids):
         """ Resets ROOT states position and velocities of selected environmments
             Sets base position based on the curriculum
@@ -1555,6 +1663,25 @@ class LeggedRobot(BaseTask):
         else:
             self.root_states[env_ids] = self.base_init_state
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
+
+            # 使用ESDF生成安全的随机位置（避开障碍物），在整个0-30米地图范围内采样
+            n = len(env_ids)
+            safe_positions = self._generate_safe_reset_positions(
+                env_ids,
+                map_range=(7.0, 23.0),  # 在整个地图范围内采样
+                z_range=(0.75, 0.85),
+                safe_clearance=0.3,
+                max_attempts=100
+            )
+            self.root_states[env_ids, :3] = safe_positions
+
+            # 随机化朝向 (yaw角)
+            random_yaw = torch_rand_float(-3.14, 3.14, (n, 1), device=self.device)  # -π到π
+            self.root_states[env_ids, 3:7] = quat_from_euler_xyz(
+                torch.zeros(n, device=self.device),  # roll=0
+                torch.zeros(n, device=self.device),  # pitch=0
+                random_yaw.squeeze()  # random yaw
+            )
         # base velocities
         self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6), device=self.device) # [7:10]: lin vel, [10:13]: ang vel
         env_ids_int32 = env_ids.to(dtype=torch.int32)
@@ -1724,7 +1851,7 @@ class LeggedRobot(BaseTask):
             self.com_displacement = torch_rand_float(self.cfg.domain_rand.com_displacement_range[0], self.cfg.domain_rand.com_displacement_range[1], (self.num_envs, 3), device=self.device)
         if self.cfg.domain_rand.randomize_body_displacement:
             self.body_displacement = torch_rand_float(self.cfg.domain_rand.body_displacement_range[0], self.cfg.domain_rand.body_displacement_range[1], (self.num_envs, 3), device=self.device)
-            
+        
         #store friction and restitution
         self.friction_coeffs = torch.ones(self.num_envs, 1, dtype=torch.float, device=self.device, requires_grad=False)
         self.restitution_coeffs = torch.zeros(self.num_envs, 1, dtype=torch.float, device=self.device, requires_grad=False)
@@ -1857,8 +1984,7 @@ class LeggedRobot(BaseTask):
             dof_props = self._process_dof_props(dof_props_asset, i)
             dof_props["driveMode"][12:].fill(gymapi.DOF_MODE_POS)
             dof_props["stiffness"][12:] = [300., 200., 200., 200., 100.,  20.,  20.,  20., 200., 200., 200., 100.,  20.,  20.,  20.]
-            dof_props["damping"][12:] = [5.0000, 4.0000, 4.0000, 4.0000, 1.0000, 0.5000, 0.5000,
-                                            0.5000, 4.0000, 4.0000, 4.0000, 1.0000, 0.5000, 0.5000, 0.5000]
+            dof_props["damping"][12:] = [5.0000, 4.0000, 4.0000, 4.0000, 1.0000, 0.5000, 0.5000, 0.5000, 4.0000, 4.0000, 4.0000, 1.0000, 0.5000, 0.5000, 0.5000]
         
         
             self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)

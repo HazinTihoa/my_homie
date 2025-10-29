@@ -91,8 +91,11 @@ class BaseTask():
         # if running with a viewer, set up keyboard shortcuts and camera
         if self.headless == False:
             # subscribe to keyboard shortcuts
+            camera_props = gymapi.CameraProperties()
+            camera_props.width = 1280  # 设置窗口宽度
+            camera_props.height = 760  # 设置窗口高度
             self.viewer = self.gym.create_viewer(
-                self.sim, gymapi.CameraProperties())
+                self.sim, camera_props)
             self.gym.subscribe_viewer_keyboard_event(
                 self.viewer, gymapi.KEY_ESCAPE, "QUIT")
             self.gym.subscribe_viewer_keyboard_event(

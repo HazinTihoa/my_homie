@@ -172,7 +172,7 @@ def get_args():
     args = gymutil.parse_arguments(
         description="RL Policy",
         custom_parameters=custom_parameters)
-    args.rl_device = "cuda:0" 
+
     args.task = "g1"
     args.resume = True 
 

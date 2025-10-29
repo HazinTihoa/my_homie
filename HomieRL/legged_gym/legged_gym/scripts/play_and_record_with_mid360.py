@@ -428,26 +428,40 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
     # cpu_inds = torch.arange(env.num_envs, dtype=torch.int32)
     # env.reset_idx(cpu_inds)
 
-    arrive_tollerance = 0.5  # pos tollerance
+
 
 
     viewer = env.viewer
-    env.gym.clear_lines(viewer)
     B      = env.num_envs
 
     torch.manual_seed(42)  # 这里设置种子为42
     root = env.root_states          # shape = (B, 13)，B = 并行环境数
     pos_xyz = root[:, 0:3].clone().to(device)
 
+    #== parameters ==
+    arrive_tollerance = 0.3  # pos tollerance
 
-    pos_bias=5
+    pos_bias=7.0  # 目标点距离机器人的基准距离
     z_range=(0.2, 1.0)
-    tar_range=3.0
-    safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device)
+    tar_range=3.0  # 在基准距离基础上的随机范围
 
+    # 在机器人周围随机方向生成偏移（可以是前后左右任意方向）
+    random_angles = torch.rand(B, device=env.device) * 2 * 3.14159  # 0到2π随机角度
+    random_radius = pos_bias  
+    bias_xy = torch.stack([
+        random_radius * torch.cos(random_angles),  # x偏移
+        random_radius * torch.sin(random_angles),  # y偏移
+        torch.zeros(B, device=env.device)           # z不偏移
+    ], dim=1)
+
+    safe_target_pos = Target_generate(pos_xyz + bias_xy, tar_range=tar_range, z_range=z_range, manager=env.esdf_manager, device=env.device)
+
+    
     need_reset = torch.zeros(B, device=env.device, dtype=torch.bool)
-    for i in range(B):
-        draw_target_cross(env, viewer, safe_target_pos[i,:])
+    
+    # env.gym.clear_lines(viewer)
+    # for i in range(B):
+    #     draw_target_cross(env, viewer, safe_target_pos[i,:])
 
     _dof  = env.gym.acquire_dof_state_tensor(env.sim)
     _rb   = env.gym.acquire_rigid_body_state_tensor(env.sim)
@@ -463,9 +477,13 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
     # 每个并行 env 对应一个缓冲区 & 计数器
     epi_buf = [dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[], qvel=[], obs_vel_and_height=[], point_cloud=[]) for _ in range(B)]
-    global_epi = 0  # 全局 episode id
+    global_epi = 0  # 全局 episode id（成功收集的）
+    total_reset_count = 0  # 总重置次数（包括成功和失败）
+    max_num_episodes = 1000  # 最大收集episode数
+    total_start_time = time.time()  # 记录总开始时间
 
     print(f"[ACT-dataset] Async saving enabled with ThreadPoolExecutor (max_workers=4)")
+    print(f"[ACT-dataset] Target: collect {max_num_episodes} episodes")
 
     # indices helpers
     rb_names = env.gym.get_actor_rigid_body_names(env.envs[0], env.actor_handles[0])
@@ -493,6 +511,7 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
     try:
         for _ in range(30 * int(env.max_episode_length)):
+            start_time = time.time()
             env.gym.refresh_dof_state_tensor(env.sim)
             env.gym.refresh_rigid_body_state_tensor(env.sim)
             env.gym.refresh_jacobian_tensors(env.sim)
@@ -571,13 +590,16 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
             # 获取点云数据（如果环境支持）
             point_clouds = None
-            if env.lidar_tensor is not None:
+            if env.downsampled_cloud is not None:
                 # 获取激光雷达点云数据
-                point_clouds = env.lidar_tensor.view(B,-1,3)  # 假设返回 (B, N, 3) 格式的点云
+                # point_clouds = env.lidar_tensor.view(B,-1,3)  # 假设返回 (B, N, 3) 格式的点云
+                point_clouds= env.downsampled_cloud  # (B, M, 3)，下采样后的点云
+                # print(f"down pc shape{point_clouds.shape}")
 
-            env.gym.clear_lines(env.viewer)
-            env._draw_lidar_vis()
-            for i in range(B):
+            # env.gym.clear_lines(env.viewer)
+            # env._draw_lidar_vis()
+
+            for i in range(B):      
                 # 动作 & qpos
                 # cmd
                 epi_buf[i]["upper_actions"].append(upper_actions[i].detach().cpu().numpy())
@@ -604,9 +626,15 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             t0=time.perf_counter()
             obs, reward, _, reset_buf, *_ = env.step(actions.detach())  # reset中也会调用
             step_time_ms = (time.perf_counter() - t0) * 1000
-            # print(f"Step time: {step_time_ms:.2f} ms")
 
-            if global_epi >= 5000:
+            # 在同一行更新，带颜色高亮
+            total_elapsed_min = (time.time() - total_start_time) / 60
+            success_rate = (global_epi / total_reset_count * 100) if total_reset_count > 0 else 0.0
+            print(f"\r\033[1;36m📊 Episodes: {global_epi:4d}/{max_num_episodes}\033[0m | \033[1;33m✓ Success: {success_rate:5.1f}%\033[0m | \033[1;35m⏱ Time: {total_elapsed_min:6.1f}min\033[0m | \033[1;32m⚡ Step: {step_time_ms:6.2f}ms\033[0m", end='', flush=True)
+
+            # 检查是否达到最大episode数
+            if global_epi >= max_num_episodes:
+                print(f"\n[ACT-dataset] Reached target of {max_num_episodes} episodes. Exiting...")
                 break
             reset_ids  = torch.nonzero(need_reset).squeeze(1)
             reset_buf = torch.nonzero(reset_buf).squeeze(1)
@@ -614,6 +642,9 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
             env0_steps = len(epi_buf[0]["upper_actions"])
             # print(f"Env 0 current episode steps: {env0_steps}")
             if reset_buf.numel()>0:
+                # 统计失败/超时的重置次数
+                total_reset_count += reset_buf.numel()
+
                 # 清空失败/超时环境的buffer（不保存）
                 for idx in reset_buf.cpu().tolist():
                     epi_buf[idx] = dict(upper_actions=[], cmd_vel_and_height=[], qpos=[],
@@ -622,8 +653,19 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 env.reset_idx(reset_buf.cuda())        # 物理重置
                 right_arm_joint[reset_buf,:] = torch.zeros(7, dtype=torch.float32,device=device) #reset arm
                 height_cmd[reset_buf]     = 0.75 #reset height
+                root = env.root_states          # shape = (B, 13)，B = 并行环境数
+                pos_xyz = root[:, 0:3].clone().to(device)
 
-                new_safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_buf)
+                # 在机器人周围随机方向生成偏移（可以是前后左右任意方向）
+                random_angles = torch.rand(B, device=env.device) * 2 * 3.14159  # 0到2π随机角度
+                random_radius = pos_bias  
+                bias_xy = torch.stack([
+                    random_radius * torch.cos(random_angles),  # x偏移
+                    random_radius * torch.sin(random_angles),  # y偏移
+                    torch.zeros(B, device=env.device)           # z不偏移
+                ], dim=1)
+
+                new_safe_target_pos = Target_generate(pos_xyz+bias_xy,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_buf)
                 safe_target_pos[reset_buf]=new_safe_target_pos
 
                 # env.gym.clear_lines(viewer)
@@ -631,6 +673,9 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                 #     draw_target_cross(env, viewer, safe_target_pos[i,:])
 
             if reset_ids.numel():
+                # 统计成功完成的重置次数
+                num_success_resets = 0
+
                 for idx in reset_ids.cpu().tolist():
                     # 异步保存 episode 数据
                     if 0 < len(epi_buf[idx]['upper_actions']) :               # 防止空 episode
@@ -650,15 +695,31 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
                         save_futures.append(future)
                         print(f"[ACT-dataset] Submitted episode {global_epi} with {len(buffer_to_save['upper_actions'])} steps for async saving")
                         global_epi += 1
+                        num_success_resets += 1
 
                         # 清空当前环境的buffer
                         epi_buf[idx] = dict(upper_actions=[], cmd_vel_and_height=[], qpos=[], eef_to_goal=[], qvel=[], obs_vel_and_height=[], point_cloud=[])
+
+                # 更新总重置次数（成功的）
+                total_reset_count += num_success_resets
 
                 env.reset_idx(reset_ids.cuda())        # 物理重置
                 height_cmd[reset_ids]     = 0.75 #reset height
                 need_reset[reset_ids] = False    # 重置后不再满足“到达”条件 
 
-                new_safe_target_pos = Target_generate(pos_xyz+pos_bias,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_ids)
+
+                root = env.root_states
+                pos_xyz = root[:, 0:3].clone().to(device)
+
+                            # 在机器人周围随机方向生成偏移（可以是前后左右任意方向）
+                random_angles = torch.rand(B, device=env.device) * 2 * 3.14159  # 0到2π随机角度
+                random_radius = pos_bias  
+                bias_xy = torch.stack([
+                    random_radius * torch.cos(random_angles),  # x偏移
+                    random_radius * torch.sin(random_angles),  # y偏移
+                    torch.zeros(B, device=env.device)           # z不偏移
+                ], dim=1)
+                new_safe_target_pos = Target_generate(pos_xyz+bias_xy,tar_range=tar_range,z_range=z_range,manager=env.esdf_manager,device=env.device,reset_indices=reset_ids)
                 safe_target_pos[reset_ids]=new_safe_target_pos
 
                 # env.gym.clear_lines(viewer)
@@ -678,12 +739,16 @@ def play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.74):
 
         # 关闭线程池
         save_executor.shutdown(wait=True)
+        final_success_rate = (global_epi / total_reset_count * 100) if total_reset_count > 0 else 0.0
         print(f"[ACT-dataset] All episodes saved. Total: {global_epi}")
+        print(f"[ACT-dataset] Success rate: {global_epi}/{total_reset_count} = {final_success_rate:.2f}%")
         print(f"=========================")
 
 if __name__ == "__main__":
     args = get_args()
     play(args, x_vel=0.0, y_vel=0.0, yaw_vel=0.0, height=0.75)
 '''
-python legged_gym/legged_gym/scripts/play_and_record.py 
+conda activate aloha
+
+CUDA_VISIBLE_DEVICE=1 python legged_gym/legged_gym/scripts/play_and_record_with_mid360.py  --num_envs 1 --sim_device cuda:0 --rl_device cuda:0
 '''
